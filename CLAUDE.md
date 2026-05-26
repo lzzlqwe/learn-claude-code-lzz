@@ -79,3 +79,21 @@ print(f"\033[1;35m[Tool Calling Result]\033[0m ...")
 3. **优先使用 Edit**：修改文件用 Edit 工具（精确替换），新建文件用 Write
 4. **一次改全**：同类修改（如全文件加注释）一次性完成，避免反复编辑
 5. **优先 mcp__ide__sourceCode**：代码、函数的定义，优先使用 sourceCode 工具读取，这样不会引入行号前缀
+
+---
+
+## 5. Windows 编码兼容规范
+
+**原则：** `Path.read_text()` / `Path.write_text()` 必须显式指定 `encoding="utf-8"`。
+
+**原因：** Windows 中文系统的默认编码为 GBK，而项目文件统一使用 UTF-8。不指定编码时，读取含中文的 UTF-8 文件会抛出 `UnicodeDecodeError: 'gbk' codec can't decode byte ...`。
+
+```python
+# ✅ 正确：显式指定 encoding="utf-8"
+text = Path("file.py").read_text(encoding="utf-8")
+Path("out.txt").write_text(content, encoding="utf-8")
+
+# ❌ 错误：依赖系统默认编码（Windows 中文系统 = GBK）
+text = Path("file.py").read_text()
+Path("out.txt").write_text(content)
+```
