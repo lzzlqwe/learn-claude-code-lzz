@@ -79,6 +79,7 @@ print(f"\033[1;35m[Tool Calling Result]\033[0m ...")
 3. **优先使用 Edit**：修改文件用 Edit 工具（精确替换），新建文件用 Write
 4. **一次改全**：同类修改（如全文件加注释）一次性完成，避免反复编辑
 5. **优先 mcp__ide__sourceCode**：代码、函数的定义，优先使用 sourceCode 工具读取，这样不会引入行号前缀
+6. **保留原流程图**：文件头部的 ASCII 流程图/架构图是代码的教学注释，修改时不可删除，中文注释补充在图下方
 
 ---
 
@@ -97,3 +98,28 @@ Path("out.txt").write_text(content, encoding="utf-8")
 text = Path("file.py").read_text()
 Path("out.txt").write_text(content)
 ```
+
+---
+
+## 6. 跨平台命令覆盖规范
+
+**原则：** 权限检查的黑名单/危险命令列表必须同时覆盖 Linux 和 Windows 命令。
+
+**原因：** LLM 会检测运行平台并自动选择对应的 Shell 命令。如果危险命令列表只含 Linux 命令（如 `rm`），LLM 在 Windows 上会用 `del` 执行删除，直接绕过权限闸门。
+
+```python
+# ✅ 正确：同时覆盖 Linux 和 Windows
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "format "]
+DESTRUCTIVE = ["rm ", "rmdir ", "del ", "erase ", "rd ", "> /etc/", "chmod 777"]
+
+# ❌ 错误：只写 Linux 命令，LLM 可在 Windows 上用 del/erase 绕过
+DESTRUCTIVE = ["rm ", "> /etc/", "chmod 777"]
+```
+
+**常用跨平台对照：**
+
+| 操作 | Linux | Windows |
+|------|-------|---------|
+| 删除文件 | `rm` / `rmdir` | `del` / `erase` / `rd` |
+| 格式化磁盘 | `mkfs` | `format` |
+| 提权 | `sudo` | `runas` |

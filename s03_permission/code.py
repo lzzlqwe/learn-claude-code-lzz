@@ -176,7 +176,8 @@ TOOL_HANDLERS = {
 # ═══════════════════════════════════════════════════════════
 
 # Gate 1: 硬黑名单 —— 命中即无条件阻断，不可绕过
-DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
+# 注意: 同时覆盖 Linux 和 Windows 命令
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda", "format "]
 
 def check_deny_list(command: str) -> str | None:
     """遍历黑名单，命中返回错误信息，否则返回 None。"""
@@ -193,7 +194,8 @@ PERMISSION_RULES = [
      "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
      "message": "Writing outside workspace"},
     {"tools": ["bash"],
-     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]),
+     # 同时覆盖 Linux (rm/rmdir) 和 Windows (del/erase/rd)
+     "check": lambda args: any(kw in args.get("command", "") for kw in ["rm ", "rmdir ", "del ", "erase ", "rd ", "> /etc/", "chmod 777"]),
      "message": "Potentially destructive command"},
 ]
 
