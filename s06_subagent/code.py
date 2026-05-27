@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-s06: Subagent — spawn sub-agents with fresh messages[] for context isolation.
+s06: Subagent — 派生子 Agent，用干净的 messages[] 做上下文隔离。
 
   Parent Agent                           Subagent
   +------------------+                  +------------------+
-  | messages=[...]   |                  | messages=[task]  | <-- fresh
+  | messages=[...]   |                  | messages=[task]  | <-- 干净上下文
   |                  |   dispatch       |                  |
   | tool: task       | ---------------> | own while loop   |
   |   prompt="..."   |                  |   bash/read/...  |
@@ -12,20 +12,26 @@ s06: Subagent — spawn sub-agents with fresh messages[] for context isolation.
   | result = "..."   | <--------------- | return last text |
   +------------------+                  +------------------+
         ^                                      |
-        |       intermediate results DISCARDED  |
+        |       中间结果全部丢弃 (上下文隔离)       |
         +--------------------------------------+
 
-  Subagent tools: bash, read, write, edit, glob (NO task — no recursion)
+  子 Agent 工具: bash, read, write, edit, glob (无 task —— 防递归)
 
-Changes from s05:
-  + task tool + spawn_subagent() with fresh messages[]
-  + Safety limit: max 30 turns per subagent
-  + extract_text() helper
-  Subagent cannot spawn sub-subagents (no task tool in sub_tools).
-  Main loop unchanged: task auto-dispatches via TOOL_HANDLERS.
+核心模式（4 步）:
+  1. 7 个工具函数（6 个继承 s05 + 1 个新增 task）
+  2. task 工具 = spawn_subagent()，独立 messages[] + 独立 SUB_SYSTEM + 30 轮上限
+  3. 子 Agent 用 SUB_TOOLS（无 task），防递归；父 Agent 用 TOOLS（含 task）
+  4. 子 Agent 只返回最终文本摘要，中间消息全部丢弃
 
-Run: python s06_subagent/code.py
-Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+s05 → s06 关键变化:
+  + task 工具 + spawn_subagent() 实现（干净 messages[] + 独立 SYSTEM prompt）
+  + 安全上限: 每个子 Agent 最多 30 轮
+  + extract_text() 辅助函数
+  + SUB_TOOLS / SUB_HANDLERS 独立工具集（无 task 防递归）
+  主循环不变: task 通过 TOOL_HANDLERS 自动分发
+
+运行: python s06_subagent/code.py
+需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
 """
 
 import os, subprocess
@@ -63,16 +69,19 @@ SUB_SYSTEM = (
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s02-s05 (unchanged): Tool Implementations
+#  FROM s02-s05 (unchanged): 工具实现 —— 6 个工具函数
+#  读/写/编辑受 safe_path 路径约束，bash 有超时+截断保护
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
+    """路径安全校验 —— 防止 LLM 通过 ../ 逃逸工作目录。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    """执行 Shell 命令。安全措施: 120 秒超时 + 输出截断至 50000 字符。"""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -82,8 +91,13 @@ def run_bash(command: str) -> str:
         return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件内容。
+    参数:
+        path: 相对于工作目录的文件路径
+        limit: 可选，限制返回行数（超出显示省略提示）
+    """
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -91,26 +105,34 @@ def run_read(path: str, limit: int | None = None) -> str:
         return f"Error: {e}"
 
 def run_write(path: str, content: str) -> str:
+    """写入内容到文件。自动创建父目录。"""
     try:
         file_path = safe_path(path)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content)
+        file_path.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """精确文本替换（只替换首次出现）。
+    参数:
+        path: 文件路径
+        old_text: 要被替换的原文本（必须精确匹配）
+        new_text: 替换后的新文本
+    """
     try:
         file_path = safe_path(path)
-        text = file_path.read_text()
+        text = file_path.read_text(encoding="utf-8")
         if old_text not in text:
             return f"Error: text not found in {path}"
-        file_path.write_text(text.replace(old_text, new_text, 1))
+        file_path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
 
 def run_glob(pattern: str) -> str:
+    """按 glob 模式匹配文件，只返回工作目录内的匹配项。"""
     import glob as g
     try:
         results = []
@@ -122,6 +144,8 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 def run_todo_write(todos: list) -> str:
+    """创建/更新任务列表。校验必填字段和 status 枚举值后存入内存。
+    终端输出彩色任务列表: pending=无图标, in_progress=青色▸, completed=绿色✓。"""
     global CURRENT_TODOS
     for i, t in enumerate(todos):
         if "content" not in t or "status" not in t:
@@ -137,10 +161,14 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 def extract_text(content) -> str:
-    """Extract text from message content blocks."""
+    """从 message content blocks 中提取纯文本。用于子 Agent 摘要提取。"""
     if not isinstance(content, list):
         return str(content)
     return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
+
+# ═══════════════════════════════════════════════════════════
+#  父 Agent 工具定义 + 分发映射（继承 s05）
+# ═══════════════════════════════════════════════════════════
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -164,9 +192,14 @@ TOOL_HANDLERS = {
 
 
 # ═══════════════════════════════════════════════════════════
-#  NEW in s06: Subagent — fresh messages[], summary only
+#  NEW in s06: 子 Agent —— 干净 messages[] + 独立工具集 + 30 轮上限
+#  关键设计:
+#    - SUB_TOOLS 不含 task，防止子 Agent 递归派生子子 Agent
+#    - SUB_SYSTEM 明确告诉子 Agent "完成即返回摘要，不要委托"
+#    - 子 Agent 所有中间消息在返回后丢弃，只有 final text 传回父 Agent
 # ═══════════════════════════════════════════════════════════
 
+# 子 Agent 工具集: 5 个基础工具，无 task/无 todo_write（只干活不计划不委托）
 SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
@@ -179,7 +212,7 @@ SUB_TOOLS = [
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
-# NO "task" tool — prevent recursive spawning
+# 注意: 无 "task" 工具 —— 防止递归派生
 
 SUB_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
@@ -187,11 +220,17 @@ SUB_HANDLERS = {
 }
 
 def spawn_subagent(description: str) -> str:
-    """Spawn a subagent with fresh messages[], return summary only."""
+    """派生子 Agent。
+    流程:
+      1. 用干净的 messages=[task] 启动独立循环
+      2. 每轮同样过 PreToolUse/PostToolUse hook（权限统一）
+      3. 最多 30 轮，安全上限
+      4. 返回最后一条 assistant 文本作为摘要，中间消息全部丢弃
+    """
     print(f"\n\033[35m[Subagent spawned]\033[0m")
-    messages = [{"role": "user", "content": description}]  # fresh context
+    messages = [{"role": "user", "content": description}]  # 干净上下文
 
-    for _ in range(30):  # safety limit
+    for _ in range(30):  # 安全上限: 最多 30 轮
         response = client.messages.create(
             model=MODEL, system=SUB_SYSTEM,
             messages=messages, tools=SUB_TOOLS, max_tokens=8000,
@@ -202,7 +241,7 @@ def spawn_subagent(description: str) -> str:
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                # Issue 1: subagent also runs hooks (permissions apply)
+                # 子 Agent 同样过 hook（权限检查统一适用）
                 blocked = trigger_hooks("PreToolUse", block)
                 if blocked:
                     results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -211,15 +250,15 @@ def spawn_subagent(description: str) -> str:
                 handler = SUB_HANDLERS.get(block.name)
                 output = handler(**block.input) if handler else f"Unknown: {block.name}"
                 trigger_hooks("PostToolUse", block, output)
+                # 灰色显示子 Agent 内部输出
                 print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": output})
         messages.append({"role": "user", "content": results})
 
-    # Issue 5: fallback if safety limit hit during tool_use
+    # 提取最终文本: 优先最后一条消息，fallback 向前查找
     result = extract_text(messages[-1]["content"])
     if not result:
-        # last message is tool_result, look backwards for assistant text
         for msg in reversed(messages):
             if msg["role"] == "assistant":
                 result = extract_text(msg["content"])
@@ -228,9 +267,9 @@ def spawn_subagent(description: str) -> str:
         if not result:
             result = "Subagent stopped after 30 turns without final answer."
     print(f"\033[35m[Subagent done]\033[0m")
-    return result  # only summary, entire message history discarded
+    return result  # 只返回摘要，中间消息历史全部丢弃
 
-# Add task tool to parent's tools
+# 向父 Agent 注册 task 工具
 TOOLS.append({
     "name": "task",
     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
@@ -240,25 +279,33 @@ TOOL_HANDLERS["task"] = spawn_subagent
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s04 (unchanged): Hook System
+#  FROM s04 (unchanged): Hook 系统 —— 注册表 + 注册函数 + 触发器
+#  PreToolUse hook 同时作用于父 Agent 和子 Agent
 # ═══════════════════════════════════════════════════════════
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
 def register_hook(event: str, callback):
+    """注册 hook: 把回调追加到指定事件的回调列表。"""
     HOOKS[event].append(callback)
 
 def trigger_hooks(event: str, *args):
+    """触发 hook: 遍历该事件的所有回调。一旦返回非 None 就停止并返回。"""
     for callback in HOOKS[event]:
         result = callback(*args)
         if result is not None:
             return result
     return None
 
-DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if="]
+
+# ── PreToolUse 回调 ──
+
+# 注意: 同时覆盖 Linux 和 Windows 命令，防止 LLM 切换平台绕过
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "format "]
 
 def permission_hook(block):
-    """PreToolUse: deny list check."""
+    """PreToolUse: 硬黑名单检查（仅 Gate 1，教学简化版）。
+    命中黑名单 → 红色输出并返回拒绝字符串阻断执行。"""
     if block.name == "bash":
         for p in DENY_LIST:
             if p in block.input.get("command", ""):
@@ -267,23 +314,31 @@ def permission_hook(block):
     return None
 
 def log_hook(block):
-    """PreToolUse: log tool calls."""
+    """PreToolUse: 记录每次工具调用（灰色日志，不干预执行）。"""
     print(f"\033[90m[HOOK] {block.name}\033[0m")
     return None
 
+
+# ── UserPromptSubmit 回调 ──
+
 def context_inject_hook(query: str):
-    """UserPromptSubmit: log working directory."""
+    """UserPromptSubmit: 在用户输入进入 LLM 前，打印当前工作目录。"""
     print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
     return None
 
+
+# ── Stop 回调 ──
+
 def summary_hook(messages: list):
-    """Stop: print tool call count."""
+    """Stop: 循环退出前打印工具调用次数统计。"""
     tool_count = sum(1 for m in messages
                      for b in (m.get("content") if isinstance(m.get("content"), list) else [])
                      if isinstance(b, dict) and b.get("type") == "tool_result")
     print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
     return None
 
+
+# 注册所有 hook
 register_hook("UserPromptSubmit", context_inject_hook)
 register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
@@ -291,15 +346,17 @@ register_hook("Stop", summary_hook)
 
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — same as s05 + nag reminder, task auto-dispatches
+#  agent_loop — s05 结构 + task 自动分发
+#  task 工具触发 spawn_subagent()，在子 Agent 内部完成独立循环后返回摘要
 # ═══════════════════════════════════════════════════════════
 
 rounds_since_todo = 0
 
 def agent_loop(messages: list):
+    """智能体主循环 —— nag 提醒 → LLM → hook → 执行（含子 Agent 派生） → todo 计数重置。"""
     global rounds_since_todo
     while True:
-        # s05: nag reminder
+        # s05: nag 提醒 —— 连续 3 轮未更新 todo，注入一条用户消息催促
         if rounds_since_todo >= 3 and messages:
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
@@ -312,6 +369,7 @@ def agent_loop(messages: list):
         messages.append({"role": "assistant", "content": response.content})
 
         if response.stop_reason != "tool_use":
+            # Stop hook: 退出前触发，返回非 None 则注入提示词强制续跑
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
@@ -323,6 +381,9 @@ def agent_loop(messages: list):
         for block in response.content:
             if block.type != "tool_use":
                 continue
+
+            # 黄色显示正在调用的工具名
+            print(f"\033[33m> {block.name}\033[0m")
 
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
@@ -338,6 +399,9 @@ def agent_loop(messages: list):
             if block.name == "todo_write":
                 rounds_since_todo = 0
 
+            # 粗体品红 = 标签，品红 = 内容（task 工具输出较长，截断 200 字符）
+            print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{output[:200]}\033[0m")
+
             results.append({"type": "tool_result", "tool_use_id": block.id,
                             "content": output})
 
@@ -345,6 +409,14 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
+    """交互入口。
+    流程:
+      1. 打印欢迎信息
+      2. 循环读取用户输入（青色提示符 s06 >>）
+      3. UserPromptSubmit hook → 进入 agent_loop
+      4. agent_loop 返回后，蓝色打印模型文本回复
+    父 Agent 可在循环中通过 task 工具派生多个子 Agent。
+    """
     print("s06: Subagent — spawn sub-agents with fresh context, summary only")
     print("Type a question, press Enter. Type q to quit.\n")
 
@@ -356,10 +428,12 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        # UserPromptSubmit hook: 在进入 LLM 前触发
         trigger_hooks("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
-                print(block.text)
+                # 蓝色显示模型最终回复
+                print(f"\033[34m{block.text}\033[0m")
         print()
