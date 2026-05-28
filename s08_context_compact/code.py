@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-s08_context_compact.py - Context Compact
+s08: Context Compact — 四层压缩管线，在 LLM 调用前自动瘦身。
 
-Four-layer compaction pipeline inserted before LLM calls:
+  L1: snip_compact       — 消息数 > 50 时裁剪中间消息
+  L2: micro_compact      — 旧 tool_result 替换为占位符
+  L3: tool_result_budget — 大输出持久化到磁盘
+  L4: compact_history    — LLM 全文摘要（1 次 API 调用）
 
-    L1: snip_compact      — trim middle messages when count > 50
-    L2: micro_compact     — replace old tool_results with placeholders
-    L3: tool_result_budget — persist large results to disk
-    L4: compact_history   — LLM full summary (1 API call)
-
-    Emergency: reactive_compact — when API still returns prompt_too_long
+  Emergency: reactive_compact — API 返回 prompt_too_long 时触发
 
     ┌─────────────────────────────────────────────────────────────┐
     │  messages[]                                                 │
@@ -23,13 +21,23 @@ Four-layer compaction pipeline inserted before LLM calls:
     │                                      └─ Yes → reactive      │
     └─────────────────────────────────────────────────────────────┘
 
-Core principle: cheap first, expensive last.
-Execution order matches CC source: budget → snip → micro → auto.
+核心原则: 便宜的先跑，贵的后跑。前 3 层 0 API 调用，只有第 4 层才花 1 次 LLM 调用。
 
-Builds on s07 (skill loading). Usage:
+核心模式（4 步）:
+  1. 启动时扫描 skills/（继承 s07）+ 创建 TRANSCRIPT_DIR / TOOL_RESULTS_DIR
+  2. 8 个工具函数 + compact 工具（直接修改 messages 列表）
+  3. 四层压缩管线: L3(budget) → L1(snip) → L2(micro) → L4(summary)
+  4. agent_loop: 每轮 LLM 调用前过压缩管线 + reactive 兜底
 
-    python s08_context_compact/code.py
-    Needs: pip install anthropic python-dotenv + ANTHROPIC_API_KEY in .env
+s07 → s08 关键变化:
+  + 四层压缩管线 (snip/micro/budget/compact_history)
+  + reactive_compact 应急机制
+  + compact 工具（Agent 可主动触发压缩）
+  + TRANSCRIPT_DIR / TOOL_RESULTS_DIR 持久化
+  循环新增: 压缩管线在 LLM 调用前运行
+
+运行: python s08_context_compact/code.py
+需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
 """
 
 import os, subprocess, json, time
@@ -55,8 +63,12 @@ client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 CURRENT_TODOS: list[dict] = []
 
-# s07: Skill catalog scan (inherited from s07)
+# ═══════════════════════════════════════════════════════════
+#  FROM s07 (unchanged): Skill 扫描 —— 启动时解析 skills/ 目录
+# ═══════════════════════════════════════════════════════════
+
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """解析 SKILL.md 的 YAML frontmatter。返回 (meta字典, 正文)。"""
     if not text.startswith("---"):
         return {}, text
     parts = text.split("---", 2)
@@ -72,6 +84,7 @@ def _parse_frontmatter(text: str) -> tuple[dict, str]:
 SKILL_REGISTRY: dict[str, dict] = {}
 
 def _scan_skills():
+    """扫描 skills/ 目录，解析每个 SKILL.md 并写入 SKILL_REGISTRY。"""
     if not SKILLS_DIR.exists():
         return
     for d in sorted(SKILLS_DIR.iterdir()):
@@ -79,7 +92,7 @@ def _scan_skills():
             continue
         manifest = d / "SKILL.md"
         if manifest.exists():
-            raw = manifest.read_text()
+            raw = manifest.read_text(encoding="utf-8")
             meta, body = _parse_frontmatter(raw)
             name = meta.get("name", d.name)
             desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
@@ -88,17 +101,19 @@ def _scan_skills():
 _scan_skills()
 
 def list_skills() -> str:
+    """列出所有已注册 skill（名称 + 一行描述）。"""
     if not SKILL_REGISTRY:
         return "(no skills found)"
     return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
 
 def load_skill(name: str) -> str:
+    """按 name 加载完整 skill 内容。通过 SKILL_REGISTRY 安全查表。"""
     skill = SKILL_REGISTRY.get(name)
     if not skill:
         return f"Skill not found: {name}"
     return skill["content"]
 
-# s08: SYSTEM includes skill catalog (inherited from s07 build_system)
+# s08: SYSTEM 包含 skill 目录（继承 s07 build_system）
 def build_system() -> str:
     catalog = list_skills()
     return (
@@ -109,7 +124,7 @@ def build_system() -> str:
 
 SYSTEM = build_system()
 
-# s08: subagent gets its own system prompt — no compact, no skill loading
+# s08: 子 Agent 的独立 SYSTEM prompt —— 无 compact, 无 skill loading
 SUB_SYSTEM = (
     f"You are a coding agent at {WORKDIR}. "
     "Complete the task you were given, then return a concise summary. "
@@ -118,15 +133,17 @@ SUB_SYSTEM = (
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s02-s07 (unchanged): Basic Tools
+#  FROM s02-s07 (unchanged): 基本工具实现 —— 6 个工具函数
 # ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
+    """路径安全校验 —— 防止 LLM 通过 ../ 逃逸工作目录。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR): raise ValueError(f"Path escapes workspace: {p}")
     return path
 
 def run_bash(command: str) -> str:
+    """执行 Shell 命令。安全措施: 120 秒超时 + 输出截断至 50000 字符。"""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)
         out = (r.stdout + r.stderr).strip()
@@ -134,28 +151,32 @@ def run_bash(command: str) -> str:
     except subprocess.TimeoutExpired: return "Error: Timeout (120s)"
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件内容。参数: path=文件路径, limit=可选行数限制。"""
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines): lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
     except Exception as e: return f"Error: {e}"
 
 def run_write(path: str, content: str) -> str:
+    """写入内容到文件。自动创建父目录。"""
     try:
         file_path = safe_path(path); file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content); return f"Wrote {len(content)} bytes to {path}"
+        file_path.write_text(content, encoding="utf-8"); return f"Wrote {len(content)} bytes to {path}"
     except Exception as e: return f"Error: {e}"
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
+    """精确文本替换（只替换首次出现）。"""
     try:
         file_path = safe_path(path)
-        text = file_path.read_text()
+        text = file_path.read_text(encoding="utf-8")
         if old_text not in text: return f"Error: text not found in {path}"
-        file_path.write_text(text.replace(old_text, new_text, 1))
+        file_path.write_text(text.replace(old_text, new_text, 1), encoding="utf-8")
         return f"Edited {path}"
     except Exception as e: return f"Error: {e}"
 
 def run_glob(pattern: str) -> str:
+    """按 glob 模式匹配文件，只返回工作目录内的匹配项。"""
     import glob as g
     try:
         results = []
@@ -166,6 +187,7 @@ def run_glob(pattern: str) -> str:
     except Exception as e: return f"Error: {e}"
 
 def run_todo_write(todos: list) -> str:
+    """创建/更新任务列表。终端输出彩色任务列表。"""
     global CURRENT_TODOS
     for i, t in enumerate(todos):
         if "content" not in t or "status" not in t:
@@ -181,12 +203,13 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 def extract_text(content) -> str:
+    """从 message content blocks 中提取纯文本。"""
     if not isinstance(content, list): return str(content)
     return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s06-s07 (unchanged): Subagent
+#  FROM s06-s07 (unchanged): 子 Agent —— 干净上下文 + 30 轮上限
 # ═══════════════════════════════════════════════════════════
 
 SUB_TOOLS = [
@@ -201,10 +224,12 @@ SUB_TOOLS = [
     {"name": "glob", "description": "Find files matching a glob pattern.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
 ]
+# 注意: 无 task/无 load_skill/无 compact/无 todo_write —— 子 Agent 只干活
 SUB_HANDLERS = {"bash": run_bash, "read_file": run_read, "write_file": run_write,
                 "edit_file": run_edit, "glob": run_glob}
 
 def spawn_subagent(task: str) -> str:
+    """派生子 Agent。独立循环 + 30 轮上限 + 只返回摘要。"""
     print(f"\n\033[35m[Subagent spawned]\033[0m")
     messages = [{"role": "user", "content": task}]
     for _ in range(30):
@@ -241,26 +266,30 @@ def spawn_subagent(task: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════
-#  NEW in s08: Four-Layer Compaction Pipeline
+#  NEW in s08: 四层压缩管线 (Four-Layer Compaction Pipeline)
+#  原则: 便宜的先跑（0 API 调用），贵的后跑（1 次 LLM 调用）
+#  执行顺序: L3(budget) → L1(snip) → L2(micro) → L4(summary)
 # ═══════════════════════════════════════════════════════════
 
-CONTEXT_LIMIT = 50000
-KEEP_RECENT = 3
-PERSIST_THRESHOLD = 30000
+CONTEXT_LIMIT = 50000       # 触发 L4 自动摘要的 token 阈值
+KEEP_RECENT = 3             # L2: 保留最近 N 个 tool_result 不压缩
+PERSIST_THRESHOLD = 30000   # L3: 超过此大小的输出才持久化到磁盘（单条 tool_result 超过此大小 → 写磁盘）
 
 def estimate_size(msgs): return len(str(msgs))
 
 
-# L1: snipCompact — trim middle messages
+# L1: snipCompact —— 消息数超限时裁剪中间消息（0 API 调用）
 def snip_compact(messages, max_messages=50):
+    """L1: 当消息数 > max_messages 时，保留头尾，中间替换为一条占位消息。"""
     if len(messages) <= max_messages: return messages
     keep_head, keep_tail = 3, max_messages - 3
     snipped = len(messages) - keep_head - keep_tail
     return messages[:keep_head] + [{"role": "user", "content": f"[snipped {snipped} messages]"}] + messages[-keep_tail:]
 
 
-# L2: microCompact — old result placeholders
+# L2: microCompact —— 旧 tool_result 替换为占位符（0 API 调用）
 def collect_tool_results(messages):
+    """收集 messages 中所有 tool_result 的位置 (msg_index, block_index, block)。"""
     blocks = []
     for mi, msg in enumerate(messages):
         if msg.get("role") != "user" or not isinstance(msg.get("content"), list): continue
@@ -270,6 +299,7 @@ def collect_tool_results(messages):
     return blocks
 
 def micro_compact(messages):
+    """L2: 保留最近 KEEP_RECENT 个 tool_result，其余的替换为占位符。"""
     tool_results = collect_tool_results(messages)
     if len(tool_results) <= KEEP_RECENT: return messages
     for _, _, block in tool_results[:-KEEP_RECENT]:
@@ -278,15 +308,18 @@ def micro_compact(messages):
     return messages
 
 
-# L3: toolResultBudget — persist large results to disk
+# L3: toolResultBudget —— 大输出持久化到磁盘（0 API 调用）
 def persist_large_output(tool_use_id, output):
+    """将超大 tool_result 写入磁盘文件，返回引用路径 + 预览。"""
     if len(output) <= PERSIST_THRESHOLD: return output
     TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
-    if not path.exists(): path.write_text(output)
+    if not path.exists(): path.write_text(output, encoding="utf-8")
     return f"<persisted-output>\nFull output: {path}\nPreview:\n{output[:2000]}\n</persisted-output>"
 
 def tool_result_budget(messages, max_bytes=200_000):
+    """L3: 当最新一轮 tool_result 总大小超 max_bytes，将最大的持久化到磁盘。"""
+    """最后一轮所有 tool_result 总大小超过此值 max_bytes → 才启动 L3"""
     last = messages[-1] if messages else None
     if not last or last.get("role") != "user" or not isinstance(last.get("content"), list): return messages
     blocks = [(i, b) for i, b in enumerate(last["content"]) if isinstance(b, dict) and b.get("type") == "tool_result"]
@@ -303,15 +336,17 @@ def tool_result_budget(messages, max_bytes=200_000):
     return messages
 
 
-# L4: autoCompact — LLM full summary
+# L4: autoCompact —— LLM 全文摘要（1 次 API 调用，最贵）
 def write_transcript(messages):
+    """将完整对话写入 .transcripts/ 目录备份。"""
     TRANSCRIPT_DIR.mkdir(parents=True, exist_ok=True)
     path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    with path.open("w") as f:
+    with path.open("w", encoding="utf-8") as f:
         for msg in messages: f.write(json.dumps(msg, default=str) + "\n")
     return path
 
 def summarize_history(messages):
+    """调用 LLM 将完整对话压缩为摘要。保留: 当前目标/关键决策/文件变更/剩余工作/用户约束。"""
     conversation = json.dumps(messages, default=str)[:80000]
     prompt = ("Summarize this coding-agent conversation so work can continue.\n"
               "Preserve: 1. current goal, 2. key findings/decisions, 3. files read/changed, "
@@ -323,21 +358,24 @@ def summarize_history(messages):
         if getattr(block, "type", None) == "text").strip() or "(empty summary)"
 
 def compact_history(messages):
+    """L4: 备份对话 → LLM 压缩 → 返回一条压缩后的 user 消息替代整个 messages。"""
     transcript_path = write_transcript(messages)
     print(f"[transcript saved: {transcript_path}]")
     summary = summarize_history(messages)
     return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 
 
-# Emergency: reactiveCompact — on API error
+# Emergency: reactiveCompact —— API 报 prompt_too_long 时触发
 def reactive_compact(messages):
+    """应急压缩: 备份 → 压缩 → 保留最近 5 条 + 摘要。"""
     transcript = write_transcript(messages)
     summary = summarize_history(messages)
     return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *messages[-5:]]
 
 
 # ═══════════════════════════════════════════════════════════
-#  FROM s07: Tool Definitions
+#  工具注册表 —— s02-s08 全部工具（9 个）
+#  s08 新增 compact: 直接触发 compact_history() 替换整个 messages
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
@@ -357,7 +395,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]}},
     {"name": "load_skill", "description": "Load the full content of a skill by name.",
      "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-    # s08 change: new compact tool — triggers compact_history, not a no-op
+    # s08: compact 工具 —— 触发 compact_history，直接替换 messages，不是一个普通返回值
     {"name": "compact", "description": "Summarize earlier conversation to free context space.",
      "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
 ]
@@ -368,7 +406,12 @@ TOOL_HANDLERS = {
     "task": spawn_subagent, "load_skill": load_skill,
 }
 
-# FROM s04 (unchanged): Hooks
+
+# ═══════════════════════════════════════════════════════════
+#  FROM s04 (unchanged): Hook 系统 —— 简化版（仅 PreToolUse / PostToolUse）
+#  注意: 同时覆盖 Linux 和 Windows 命令
+# ═══════════════════════════════════════════════════════════
+
 HOOKS = {"PreToolUse": [], "PostToolUse": []}
 def trigger_hooks(event, *args):
     for cb in HOOKS[event]:
@@ -376,13 +419,15 @@ def trigger_hooks(event, *args):
         if r is not None: return r
     return None
 
-DENY_LIST = ["rm -rf /", "sudo", "shutdown"]
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "format "]
 def permission_hook(block):
+    """PreToolUse: 硬黑名单检查。命中 → 返回拒绝字符串阻断执行。"""
     if block.name == "bash":
         for p in DENY_LIST:
             if p in block.input.get("command", ""): return "Permission denied"
     return None
 def log_hook(block):
+    """PreToolUse: 记录每次工具调用（灰色日志）。"""
     print(f"\033[90m[HOOK] {block.name}\033[0m")
     return None
 
@@ -391,28 +436,30 @@ HOOKS["PreToolUse"].append(log_hook)
 
 
 # ═══════════════════════════════════════════════════════════
-#  agent_loop — s08 core: run compaction pipeline before LLM
+#  agent_loop — s08 核心: 每次 LLM 调用前过四层压缩管线
+#  管线: L3→L1→L2→[L4 if 超限] → LLM → [reactive if prompt_too_long]
 # ═══════════════════════════════════════════════════════════
 
-MAX_REACTIVE_RETRIES = 1  # retry limit for reactive compact
+MAX_REACTIVE_RETRIES = 1
 
 def agent_loop(messages: list):
+    """智能体主循环 —— 压缩管线 → LLM → hook → 执行 → reactive 兜底。"""
     reactive_retries = 0
     while True:
-        # s08 change: three preprocessors (0 API calls, cheap first)
-        # Order matches CC source: budget → snip → micro
-        messages[:] = tool_result_budget(messages)    # L3: persist large results first
-        messages[:] = snip_compact(messages)          # L1: trim middle
-        messages[:] = micro_compact(messages)         # L2: old result placeholders
+        # s08: 前三层预处理（0 API 调用，便宜的先跑）
+        # 执行顺序与 CC 源码一致: budget → snip → micro
+        messages[:] = tool_result_budget(messages)    # L3: 大结果持久化到磁盘
+        messages[:] = snip_compact(messages)          # L1: 裁剪中间消息
+        messages[:] = micro_compact(messages)         # L2: 旧 tool_result 占位符
 
-        # s08 change: tokens still over threshold → LLM summary (1 API call)
+        # s08: token 仍超限 → 触发 LLM 摘要（1 次 API 调用）
         if estimate_size(messages) > CONTEXT_LIMIT:
             print("[auto compact]")
             messages[:] = compact_history(messages)
 
         try:
             response = client.messages.create(model=MODEL, system=SYSTEM, messages=messages, tools=TOOLS, max_tokens=8000)
-            reactive_retries = 0  # reset on successful API call
+            reactive_retries = 0
         except Exception as e:
             if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
                 print("[reactive compact]")
@@ -427,15 +474,17 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type != "tool_use": continue
-            print(f"\033[36m> {block.name}\033[0m")
 
-            # s08: compact tool triggers compact_history, not a no-op string
+            # 黄色显示正在调用的工具名
+            print(f"\033[33m> {block.name}\033[0m")
+
+            # s08: compact 工具直接触发压缩，替换整个 messages
             if block.name == "compact":
                 messages[:] = compact_history(messages)
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": "[Compacted. Conversation history has been summarized.]"})
                 messages.append({"role": "user", "content": results})
-                break  # end current turn, start fresh with compacted context
+                break  # 结束当前轮，用压缩后的上下文重新开始
 
             blocked = trigger_hooks("PreToolUse", block)
             if blocked:
@@ -444,17 +493,24 @@ def agent_loop(messages: list):
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"Unknown: {block.name}"
             trigger_hooks("PostToolUse", block, output)
-            print(str(output)[:200])
+            # 粗体品红 = 标签，品红 = 内容
+            print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{output[:200]}\033[0m")
             results.append({"type": "tool_result", "tool_use_id": block.id, "content": str(output)})
         else:
-            # normal path: no compact was called
+            # compact 未被调用
             messages.append({"role": "user", "content": results})
             continue
-        # compact was called: results already appended above
+        # compact 被调用: results 已在上方追加
         continue
 
 
 if __name__ == "__main__":
+    """交互入口。流程:
+      1. 打印欢迎信息
+      2. 循环读取用户输入（青色提示符 s08 >>）
+      3. 进入 agent_loop（含四层压缩管线）
+      4. agent_loop 返回后，蓝色打印模型文本回复
+    """
     print("s08: Context Compact — four-layer compaction pipeline")
     print("输入问题，回车发送。输入 q 退出。\n")
     history = []
@@ -465,5 +521,7 @@ if __name__ == "__main__":
         history.append({"role": "user", "content": query})
         agent_loop(history)
         for block in history[-1]["content"]:
-            if getattr(block, "type", None) == "text": print(block.text)
+            if getattr(block, "type", None) == "text":
+                # 蓝色显示模型最终回复
+                print(f"\033[34m{block.text}\033[0m")
         print()
