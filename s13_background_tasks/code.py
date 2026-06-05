@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """
-s13: Background Tasks — thread-based async execution + notification injection.
+s13: Background Tasks — 线程异步执行 + 通知注入。
 
-Run:  python s13_background_tasks/code.py
-Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
+核心模式（4 步）:
+  1. should_run_background: 模型显式请求(run_in_background) 或 启发式(慢操作关键词)
+  2. start_background_task: daemon 线程派发 → 立即返回占位符，不阻塞主循环
+  3. collect_background_results: 每轮结束后收集完成的后台任务 → 以 <task_notification> 注入
+  4. threading.Lock: background_tasks / background_results 线程安全
 
-Changes from s12:
-  - threading.Thread for background execution
-  - background_tasks dict for lifecycle tracking (bg_id, command, status)
-  - background_results dict + threading.Lock for thread-safe storage
-  - should_run_background: model explicit request via run_in_background param
-  - is_slow_operation: fallback heuristic when model doesn't specify
-  - start_background_task: dispatch to daemon thread, return bg task id
-  - collect_background_results: gather completed, return as notifications
-  - agent_loop: slow ops → background + placeholder, inject notifications
-  - Notifications use <task_notification> format, not reused tool_use_id
+s12 → s13 关键变化:
+  + threading.Thread 后台执行
+  + background_tasks 字典（生命周期追踪）+ background_results 字典 + threading.Lock
+  + should_run_background: 模型显式 run_in_background + 慢操作启发式（install/build/test...）
+  + start_background_task: daemon 线程派发，返回 bg_id
+  + collect_background_results: 收集已完成任务，以 <task_notification> 格式注入
+  + agent_loop: 慢操作 → 后台 + 占位符，每轮结束注入通知
 
-Note: Teaching code keeps a basic agent loop to stay focused on background
-tasks. S11's full error recovery (RecoveryState, backoff, escalation,
-reactive compact, fallback model) is omitted.
+注意: s13 是教学骨架版，聚焦后台任务。s11 的完整 error recovery 省略。
+
+运行: python s13_background_tasks/code.py
+需要: pip install anthropic python-dotenv + .env 中配置 ANTHROPIC_API_KEY
 """
 
 import os, subprocess, json, time, random, threading
@@ -44,7 +45,9 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12, synced) ──
+# ═══════════════════════════════════════════════════════════
+#  FROM s12: Task System —— 文件持久化任务图 + blockedBy 依赖
+# ═══════════════════════════════════════════════════════════
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -52,12 +55,13 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
+    """任务数据类。status: pending→in_progress→completed。blockedBy: 依赖的前置任务 ID。"""
     id: str
     subject: str
     description: str
     status: str          # pending | in_progress | completed
-    owner: str | None
-    blockedBy: list[str]
+    owner: str | None    # Agent 名称（多 Agent 场景）
+    blockedBy: list[str] # 依赖的前置任务 ID 列表
 
 
 def _task_path(task_id: str) -> Path:
@@ -66,6 +70,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创建任务并持久化。ID = task_{timestamp}_{random}。"""
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -77,27 +82,29 @@ def create_task(subject: str, description: str = "",
 
 
 def save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+    """持久化任务到 .tasks/{id}.json。"""
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2), encoding="utf-8")
 
 
 def load_task(task_id: str) -> Task:
-    return Task(**json.loads(_task_path(task_id).read_text()))
+    """从 .tasks/{id}.json 加载任务。"""
+    return Task(**json.loads(_task_path(task_id).read_text(encoding="utf-8")))
 
 
 def list_tasks() -> list[Task]:
-    return [Task(**json.loads(p.read_text()))
+    """列出所有任务（按文件名排序）。"""
+    return [Task(**json.loads(p.read_text(encoding="utf-8")))
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
 def get_task(task_id: str) -> str:
-    """Return full task details as JSON."""
+    """返回任务完整 JSON 详情。"""
     task = load_task(task_id)
     return json.dumps(asdict(task), indent=2)
 
 
 def can_start(task_id: str) -> bool:
-    """Check if all blockedBy dependencies are completed.
-    Missing dependencies are treated as blocked."""
+    """检查所有 blockedBy 依赖是否已完成。缺失的依赖文件视为阻塞。"""
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -108,6 +115,7 @@ def can_start(task_id: str) -> bool:
 
 
 def claim_task(task_id: str, owner: str = "agent") -> str:
+    """认领 pending 任务。校验状态 + 依赖检查 → 设置 owner + pending→in_progress。"""
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
@@ -123,6 +131,7 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 
 def complete_task(task_id: str) -> str:
+    """完成 in_progress 任务。报告被解锁的下游任务。"""
     task = load_task(task_id)
     if task.status != "in_progress":
         return f"Task {task_id} is {task.status}, cannot complete"
@@ -138,7 +147,9 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ═══════════════════════════════════════════════════════════
+#  FROM s10: Prompt 组装 —— PROMPT_SECTIONS + assemble + cache
+# ═══════════════════════════════════════════════════════════
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -150,6 +161,7 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
+    """根据 context 拼接 prompt。始终加载 identity/tools/workspace，按需加载 memory。"""
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -163,6 +175,7 @@ _last_context_key, _last_prompt = None, None
 
 
 def get_system_prompt(context: dict) -> str:
+    """带缓存的 prompt 获取。json.dumps 做确定性 key。"""
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
@@ -172,9 +185,12 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ═══════════════════════════════════════════════════════════
+#  基本工具实现 —— 3 个基础工具 + 5 个任务工具
+# ═══════════════════════════════════════════════════════════
 
 def safe_path(p: str) -> Path:
+    """路径安全校验 —— 防止 LLM 通过 ../ 逃逸工作目录。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -182,7 +198,7 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
+    """执行 Shell 命令。run_in_background 由 agent_loop 分发层处理，不在函数内部。"""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -193,8 +209,9 @@ def run_bash(command: str, run_in_background: bool = False) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件内容。"""
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -203,19 +220,21 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """写入内容到文件。自动创建父目录。"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
-# Task tools
+# Task 工具（从 s12 继承）
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
+    """创建任务（可选 blockedBy 依赖）。蓝色终端输出。"""
     task = create_task(subject, description, blockedBy)
     deps = f" (blockedBy: {', '.join(blockedBy)})" if blockedBy else ""
     print(f"  \033[34m[create] {task.subject}{deps}\033[0m")
@@ -223,6 +242,7 @@ def run_create_task(subject: str, description: str = "",
 
 
 def run_list_tasks() -> str:
+    """列出所有任务（状态图标: ○ pending / ● in_progress / ✓ completed）。"""
     tasks = list_tasks()
     if not tasks:
         return "No tasks. Use create_task to add some."
@@ -238,6 +258,7 @@ def run_list_tasks() -> str:
 
 
 def run_get_task(task_id: str) -> str:
+    """获取任务完整 JSON 详情。"""
     try:
         return get_task(task_id)
     except FileNotFoundError:
@@ -245,10 +266,12 @@ def run_get_task(task_id: str) -> str:
 
 
 def run_claim_task(task_id: str) -> str:
+    """认领任务（pending→in_progress，依赖未满足时拒绝）。"""
     return claim_task(task_id, owner="agent")
 
 
 def run_complete_task(task_id: str) -> str:
+    """完成任务（in_progress→completed，报告解锁的下游任务）。"""
     return complete_task(task_id)
 
 
@@ -257,7 +280,7 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {
                           "command": {"type": "string"},
-                          "run_in_background": {"type": "boolean"}},
+                          "run_in_background": {"type": "boolean"}},  #输入参数多了run_in_background
                       "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
      "input_schema": {"type": "object",
@@ -307,16 +330,20 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Background Tasks (s13 new) ──
+# ═══════════════════════════════════════════════════════════
+#  NEW in s13: Background Tasks —— 线程异步执行 + 通知注入
+#  两条判断路径: 模型显式 run_in_background 或 慢操作关键词启发式
+#  完成后以 <task_notification> 格式注入到 user message 中
+# ═══════════════════════════════════════════════════════════
 
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}   # bg_id → {tool_use_id, command, status}
 background_results: dict[str, str] = {}   # bg_id → output
-background_lock = threading.Lock()
+background_lock = threading.Lock()        # 线程安全锁
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
+    """启发式判断: 命令包含慢操作关键词（install/build/test/deploy...）。"""
     if tool_name != "bash":
         return False
     cmd = tool_input.get("command", "").lower()
@@ -327,14 +354,14 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
+    """判断是否后台执行: 模型显式请求优先，其次启发式判断。"""
     if tool_input.get("run_in_background"):
         return True
     return is_slow_operation(tool_name, tool_input)
 
 
 def execute_tool(block) -> str:
-    """Execute a tool call block, return output."""
+    """执行工具调用 block，返回输出。"""
     handler = TOOL_HANDLERS.get(block.name)
     if handler:
         return handler(**block.input)
@@ -342,13 +369,14 @@ def execute_tool(block) -> str:
 
 
 def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
+    """派发工具到 daemon 线程执行，立即返回 bg_id（不等待完成）。"""
     global _bg_counter
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
     cmd = block.input.get("command", block.name)
 
     def worker():
+        """daemon 线程 worker: 执行工具 → 写入结果。"""
         result = execute_tool(block)
         with background_lock:
             background_tasks[bg_id]["status"] = "completed"
@@ -367,7 +395,7 @@ def start_background_task(block) -> str:
 
 
 def collect_background_results() -> list[str]:
-    """Collect completed background results as task_notification messages."""
+    """收集已完成的后台任务，以 <task_notification> XML 格式返回通知列表。"""
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
@@ -389,13 +417,13 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── Context ──
+# ── Context（从 s10 继承）──
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state."""
+    """根据真实状态更新 context: 工具列表 / 工作目录 / 记忆索引。"""
     memories = ""
     if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
+        content = MEMORY_INDEX.read_text(encoding="utf-8").strip()
         if content:
             memories = content
     return {
@@ -405,9 +433,12 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop (simplified, focused on background tasks) ──
+# ═══════════════════════════════════════════════════════════
+#  agent_loop — s13 核心: 慢操作后台化 + 通知注入
+# ═══════════════════════════════════════════════════════════
 
 def agent_loop(messages: list, context: dict):
+    """主循环 —— 后台任务分流: should_run_background → 线程派发 → 通知收集注入。"""
     system = get_system_prompt(context)
     while True:
         try:
@@ -428,8 +459,10 @@ def agent_loop(messages: list, context: dict):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"\033[36m> {block.name}\033[0m")
+            # 黄色显示正在调用的工具名
+            print(f"\033[33m> {block.name}\033[0m")
 
+            # s13: 慢操作 → 后台线程 + 返回占位符
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block)
                 results.append({"type": "tool_result",
@@ -439,26 +472,32 @@ def agent_loop(messages: list, context: dict):
                                            f"Result will be available when complete."})
             else:
                 output = execute_tool(block)
-                print(str(output)[:300])
+                # 粗体品红 = 标签，品红 = 内容
+                print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{output[:300]}\033[0m")
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Inject background notifications + tool results in one user message
-        user_content = []
+        # s13: 注入 工具结果 + 后台通知 到同一条 user message
+        user_content = list(results)
         bg_notifications = collect_background_results()
         if bg_notifications:
             for notif in bg_notifications:
                 user_content.append({"type": "text", "text": notif})
             print(f"  \033[32m[inject] {len(bg_notifications)} background "
                   f"notification(s)\033[0m")
-        user_content.extend(results)
         messages.append({"role": "user", "content": user_content})
         context = update_context(context, messages)
         system = get_system_prompt(context)
 
 
 if __name__ == "__main__":
+    """交互入口。流程:
+      1. 打印欢迎信息
+      2. 循环读取用户输入（青色提示符 s13 >>）
+      3. 进入 agent_loop（慢操作自动后台化 + 通知注入）
+      4. agent_loop 返回后，蓝色打印模型文本回复
+    """
     print("s13: background tasks")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
@@ -475,5 +514,6 @@ if __name__ == "__main__":
         context = update_context(context, history)
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
-                print(block.text)
+                # 蓝色显示模型最终回复
+                print(f"\033[34m{block.text}\033[0m")
         print()
