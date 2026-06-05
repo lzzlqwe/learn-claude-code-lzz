@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-s14: Cron Scheduler — independent daemon thread + queue processor.
+s14: Cron Scheduler — 定时任务调度器，独立守护线程 + 队列处理。
+核心模式（4 层架构）:
+  1. Scheduler: 守护线程每秒检查 cron 表达式 → 匹配时投递到队列
+  2. Queue: cron_queue 解耦调度器与 Agent 主循环
+  3. Queue Processor: 检测队列有任务 + Agent 空闲 → 唤醒 agent_loop
+  4. Consumer: agent_loop 消费队列任务，注入到消息历史
 
 Run:  python s14_cron_scheduler/code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
@@ -46,7 +51,7 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12, synced) ──
+# ── Task System (from s12, synced) ── 任务系统（继承自 s12）──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -54,12 +59,13 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
+    """任务数据类。status: pending→in_progress→completed。blockedBy: 依赖的前置任务 ID 列表。"""
     id: str
     subject: str
     description: str
     status: str          # pending | in_progress | completed
-    owner: str | None
-    blockedBy: list[str]
+    owner: str | None    # Agent 名称（多 Agent 场景用）
+    blockedBy: list[str] # 依赖的前置任务 ID 列表
 
 
 def _task_path(task_id: str) -> Path:
@@ -68,6 +74,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创建任务并持久化。ID = task_{timestamp}_{random}。"""
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -79,27 +86,29 @@ def create_task(subject: str, description: str = "",
 
 
 def save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+    """持久化任务到 .tasks/{id}.json。"""
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2), encoding="utf-8")
 
 
 def load_task(task_id: str) -> Task:
-    return Task(**json.loads(_task_path(task_id).read_text()))
+    """从 .tasks/{id}.json 加载任务。"""
+    return Task(**json.loads(_task_path(task_id).read_text(encoding="utf-8")))
 
 
 def list_tasks() -> list[Task]:
-    return [Task(**json.loads(p.read_text()))
+    """列出所有任务（按文件名排序）。"""
+    return [Task(**json.loads(p.read_text(encoding="utf-8")))
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
 def get_task(task_id: str) -> str:
-    """Return full task details as JSON."""
+    """返回任务完整 JSON 详情。"""
     task = load_task(task_id)
     return json.dumps(asdict(task), indent=2)
 
 
 def can_start(task_id: str) -> bool:
-    """Check if all blockedBy dependencies are completed.
-    Missing dependencies are treated as blocked."""
+    """检查所有 blockedBy 依赖是否已完成。缺失的依赖文件视为阻塞。"""
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -140,7 +149,7 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ── Prompt Assembly (from s10, synced) ── Prompt 组装（继承自 s10）──
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -153,6 +162,7 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
+    """根据 context 拼接 prompt。始终加载 identity/tools/workspace，按需加载 memory。"""
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -166,6 +176,7 @@ _last_context_key, _last_prompt = None, None
 
 
 def get_system_prompt(context: dict) -> str:
+    """带缓存的 prompt 获取。json.dumps 做确定性 key，避免相同 context 重复拼接。"""
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
@@ -175,9 +186,10 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ── Tools ── 工具函数实现 ──
 
 def safe_path(p: str) -> Path:
+    """路径安全校验 —— 防止 LLM 通过 ../ 逃逸工作目录。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -185,7 +197,8 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
+    """执行 Shell 命令。120 秒超时 + 输出截断至 50000 字符。
+    run_in_background 由 agent_loop 调度层处理，此处不做后台执行。"""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -196,8 +209,9 @@ def run_bash(command: str, run_in_background: bool = False) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件内容。参数: path=文件路径, limit=可选行数限制。"""
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -206,16 +220,17 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """写入内容到文件。自动创建父目录。"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
-# Task tools
+# Task tools ── 任务工具函数 ──
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -255,7 +270,7 @@ def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
 
-# ── Background Tasks (from s13, synced) ──
+# ── Background Tasks (from s13, synced) ── 后台任务（继承自 s13）──
 
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
@@ -264,7 +279,7 @@ background_lock = threading.Lock()
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
+    """启发式兜底：命令关键词匹配，判断是否可能耗时 > 30s。"""
     if tool_name != "bash":
         return False
     cmd = tool_input.get("command", "").lower()
@@ -275,14 +290,14 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
+    """两条判断路径：1. 模型显式请求 → 直接后台  2. 关键词启发式兜底。"""
     if tool_input.get("run_in_background"):
         return True
     return is_slow_operation(tool_name, tool_input)
 
 
 def execute_tool(block) -> str:
-    """Execute a tool call block, return output."""
+    """执行工具调用 block，返回输出。根据 block.name 路由到对应 handler。"""
     handler = {
         "bash": run_bash, "read_file": run_read, "write_file": run_write,
         "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -297,7 +312,7 @@ def execute_tool(block) -> str:
 
 
 def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
+    """在 daemon 线程中执行工具。注册 bg_id → 启动线程 → 立即返回占位符。"""
     global _bg_counter
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
@@ -321,7 +336,8 @@ def start_background_task(block) -> str:
 
 
 def collect_background_results() -> list[str]:
-    """Collect completed background results as task_notification messages."""
+    """收集已完成的 background 结果，pop 后格式化为 <task_notification> XML。
+    pop 确保不会重复注入。"""
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
@@ -343,18 +359,23 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── Cron Scheduler (s14 new) ──
+# ── Cron Scheduler (s14 new) ── Cron 定时调度器（s14 新增）──
 
 DURABLE_PATH = WORKDIR / ".scheduled_tasks.json"
 
 
 @dataclass
 class CronJob:
+    """定时任务数据类。
+    cron: 5 字段 cron 表达式（min hour dom month dow）
+    recurring: True=重复任务 / False=一次性任务
+    durable: True=持久化到磁盘 / False=仅会话内存
+    """
     id: str
     cron: str        # "0 9 * * *"
-    prompt: str      # message to inject when fired
-    recurring: bool  # True = recurring, False = one-shot
-    durable: bool    # True = persist to disk
+    prompt: str      # 触发时注入的消息
+    recurring: bool  # True = 重复任务, False = 一次性
+    durable: bool    # True = 持久化到磁盘
 
 
 scheduled_jobs: dict[str, CronJob] = {}
@@ -365,7 +386,7 @@ _last_fired: dict[str, str] = {}  # job_id → "YYYY-MM-DD HH:MM"
 
 
 def _cron_field_matches(field: str, value: int) -> bool:
-    """Match a single cron field against a value."""
+    """匹配单个 cron 字段。支持 * / , - 四种模式。"""
     if field == "*":
         return True
     if field.startswith("*/"):
@@ -381,13 +402,13 @@ def _cron_field_matches(field: str, value: int) -> bool:
 
 
 def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    """Check if a 5-field cron expression matches the given datetime.
-    Standard cron semantics: DOM and DOW use OR when both are constrained."""
+    """检查 5 字段 cron 表达式是否匹配给定时间。
+    标准 cron 语义：DOM 和 DOW 同时约束时使用 OR 逻辑。"""
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return False
     minute, hour, dom, month, dow = fields
-    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0
+    dow_val = (dt.weekday() + 1) % 7  # Python Monday=0 → cron Sunday=0（Python 周一=0，cron 周日=0）
 
     m = _cron_field_matches(minute, dt.minute)
     h = _cron_field_matches(hour, dt.hour)
@@ -395,10 +416,10 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     month_ok = _cron_field_matches(month, dt.month)
     dow_ok = _cron_field_matches(dow, dow_val)
 
-    # Minute, hour, month must all match
+    # 分钟、小时、月份必须全部匹配（Minute, hour, month must all match）
     if not (m and h and month_ok):
         return False
-    # DOM and DOW: if both constrained, either matching is enough (OR)
+    # DOM 和 DOW：两者同时约束时，任一匹配即可（OR 逻辑）
     dom_unconstrained = dom == "*"
     dow_unconstrained = dow == "*"
     if dom_unconstrained and dow_unconstrained:
@@ -411,7 +432,7 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
 
 
 def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
-    """Validate a single cron field value is within [lo, hi]."""
+    """校验单个 cron 字段值是否在 [lo, hi] 范围内。支持 * / , - 模式。"""
     if field == "*":
         return None
     if field.startswith("*/"):
@@ -446,7 +467,7 @@ def _validate_cron_field(field: str, lo: int, hi: int) -> str | None:
 
 
 def validate_cron(cron_expr: str) -> str | None:
-    """Validate a cron expression. Returns error message or None."""
+    """校验 cron 表达式合法性。返回错误消息或 None（表示合法）。"""
     fields = cron_expr.strip().split()
     if len(fields) != 5:
         return f"Expected 5 fields, got {len(fields)}"
@@ -460,17 +481,17 @@ def validate_cron(cron_expr: str) -> str | None:
 
 
 def save_durable_jobs():
-    """Persist durable jobs to .scheduled_tasks.json."""
+    """将 durable 任务持久化到 .scheduled_tasks.json。"""
     durable = [asdict(j) for j in scheduled_jobs.values() if j.durable]
-    DURABLE_PATH.write_text(json.dumps(durable, indent=2))
+    DURABLE_PATH.write_text(json.dumps(durable, indent=2), encoding="utf-8")
 
 
 def load_durable_jobs():
-    """Load durable jobs from disk on startup."""
+    """启动时从磁盘加载 durable 任务。跳过 cron 表达式不合法的任务。"""
     if not DURABLE_PATH.exists():
         return
     try:
-        jobs = json.loads(DURABLE_PATH.read_text())
+        jobs = json.loads(DURABLE_PATH.read_text(encoding="utf-8"))
         for j in jobs:
             job = CronJob(**j)
             err = validate_cron(job.cron)
@@ -487,7 +508,7 @@ def load_durable_jobs():
 
 def schedule_job(cron: str, prompt: str, recurring: bool = True,
                  durable: bool = True) -> CronJob | str:
-    """Register a new cron job. Returns CronJob or error string."""
+    """注册新的 cron 任务。先校验表达式 → 创建 CronJob → 持久化。返回 CronJob 或错误字符串。"""
     err = validate_cron(cron)
     if err:
         return err
@@ -505,7 +526,7 @@ def schedule_job(cron: str, prompt: str, recurring: bool = True,
 
 
 def cancel_job(job_id: str) -> str:
-    """Cancel a cron job."""
+    """取消 cron 任务。从内存移除 + 更新持久化文件。"""
     with cron_lock:
         job = scheduled_jobs.pop(job_id, None)
     if not job:
@@ -517,13 +538,14 @@ def cancel_job(job_id: str) -> str:
 
 
 def cron_scheduler_loop():
-    """Independent daemon thread: poll every 1s, fire matching jobs.
-    Individual job errors are caught to prevent one bad job from
-    killing the entire scheduler thread."""
+    """独立守护线程：每 1s 轮询，匹配 cron 表达式 → 投递到 cron_queue。
+    使用日期感知的 minute_marker 防止日级任务在第 2 天重复触发。
+    _last_fired 字典的核心作用是防止在同一分钟内被触发 60 次（防抖）
+    单个任务错误不会杀死整个调度线程。"""
     while True:
         time.sleep(1)
         now = datetime.now()
-        # Date-aware marker prevents daily jobs from skipping on day 2+
+        # 日期感知的 minute_marker 防止日级任务在第 2 天重复触发（Date-aware marker prevents daily jobs from skipping on day 2+）
         minute_marker = now.strftime("%Y-%m-%d %H:%M")
         with cron_lock:
             for job in list(scheduled_jobs.values()):
@@ -543,7 +565,7 @@ def cron_scheduler_loop():
 
 
 def consume_cron_queue() -> list[CronJob]:
-    """Consume fired jobs from cron_queue (called by agent_loop)."""
+    """消费 cron_queue 中已触发的任务（由 agent_loop 调用）。取出后清空队列。"""
     with cron_lock:
         fired = list(cron_queue)
         cron_queue.clear()
@@ -551,18 +573,18 @@ def consume_cron_queue() -> list[CronJob]:
 
 
 def has_cron_queue() -> bool:
-    """Return whether fired cron jobs are waiting to be delivered."""
+    """检查是否有已触发的 cron 任务等待投递。"""
     with cron_lock:
         return bool(cron_queue)
 
 
-# Load durable jobs on startup, then start scheduler thread
+# 启动时加载持久化任务，然后启动调度线程（Load durable jobs on startup, then start scheduler thread）
 load_durable_jobs()
 threading.Thread(target=cron_scheduler_loop, daemon=True).start()
 print("  \033[35m[cron] scheduler thread started\033[0m")
 
 
-# ── Cron Tools ──
+# ── Cron Tools ── Cron 工具函数 ──
 
 def run_schedule_cron(cron: str, prompt: str,
                       recurring: bool = True, durable: bool = True) -> str:
@@ -590,7 +612,7 @@ def run_cancel_cron(job_id: str) -> str:
     return cancel_job(job_id)
 
 
-# ── Tool Definitions ──
+# ── Tool Definitions ── 工具 Schema 定义 ──
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -662,13 +684,13 @@ TOOLS = [
 ]
 
 
-# ── Context ──
+# ── Context ── 上下文管理 ──
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state."""
+    """根据真实状态更新上下文：工具列表 / 工作目录 / 记忆索引。"""
     memories = ""
     if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
+        content = MEMORY_INDEX.read_text(encoding="utf-8").strip()
         if content:
             memories = content
     return {
@@ -678,15 +700,21 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop (simplified, focused on cron scheduler) ──
-# Teaching code keeps a basic agent loop. S11's full error recovery is omitted.
-# cron_scheduler_loop produces work; queue_processor_loop wakes this loop when
-# queued work exists and no other agent turn is running.
+# ── Agent Loop (simplified, focused on cron scheduler) ── Agent 主循环 ──
+# 教学代码保留基础 agent_loop。s11 的完整错误恢复被省略。
+# cron_scheduler_loop 产生任务；queue_processor_loop 在队列有任务且 Agent 空闲时唤醒主循环。
 
 def agent_loop(messages: list, context: dict) -> dict:
+    """Agent 主循环。流程：
+    1. 消费 cron 队列中的定时任务 → 注入消息
+    2. 调用 LLM → 获取响应
+    3. 分流工具执行：后台（daemon 线程）或 同步
+    4. 合并后台通知 + 工具结果 → 追加消息
+    5. 循环直到 stop_reason != tool_use
+    """
     system = get_system_prompt(context)
     while True:
-        # Layer 4: consume fired cron jobs → inject as messages
+        # 第 4 层：消费已触发的 cron 任务 → 注入为消息（Layer 4: consume fired cron jobs → inject as messages）
         fired = consume_cron_queue()
         for job in fired:
             messages.append({"role": "user",
@@ -711,7 +739,7 @@ def agent_loop(messages: list, context: dict) -> dict:
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"\033[36m> {block.name}\033[0m")
+            print(f"\033[33m> {block.name}\033[0m")
 
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block)
@@ -721,18 +749,17 @@ def agent_loop(messages: list, context: dict) -> dict:
                                            f"Result will be available when complete."})
             else:
                 output = execute_tool(block)
-                print(str(output)[:300])
+                print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{str(output)[:300]}\033[0m")
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Merge background notifications + tool results into one user message
-        user_content = []
+        # 合并后台通知 + 工具结果到同一条 user 消息（Merge background notifications + tool results into one user message）
+        user_content = list(results)
         bg_notifications = collect_background_results()
         if bg_notifications:
             for notif in bg_notifications:
                 user_content.append({"type": "text", "text": notif})
-        user_content.extend(results)
         messages.append({"role": "user", "content": user_content})
         context = update_context(context, messages)
         system = get_system_prompt(context)
@@ -743,7 +770,7 @@ session_context = update_context({}, [])
 
 
 def print_latest_assistant_text(messages: list):
-    """Print text blocks from the latest assistant message."""
+    """打印最后一条 assistant 消息中的文本 block。用于终端蓝色输出模型回复。"""
     if not messages:
         return
     msg = messages[-1]
@@ -751,17 +778,18 @@ def print_latest_assistant_text(messages: list):
         return
     content = msg.get("content", "")
     if isinstance(content, str):
-        print(content)
+        print(f"\033[34m{content}\033[0m")
         return
     for block in content:
         if getattr(block, "type", None) == "text":
-            print(block.text)
+            print(f"\033[34m{block.text}\033[0m")
         elif isinstance(block, dict) and block.get("type") == "text":
-            print(block.get("text", ""))
+            print(f"\033[34m{block.get('text', '')}\033[0m")
 
 
 def run_agent_turn_locked(user_query: str | None = None):
-    """Run one agent turn. Caller must hold agent_lock."""
+    """执行一轮 Agent turn。调用者必须持有 agent_lock。
+    互斥锁确保同一时间只有一个 Agent turn 在运行，防止用户输入和 cron 队列并发冲突。"""
     global session_context
     if user_query is not None:
         session_history.append({"role": "user", "content": user_query})
@@ -772,7 +800,9 @@ def run_agent_turn_locked(user_query: str | None = None):
 
 
 def queue_processor_loop():
-    """Auto-deliver fired cron jobs when the agent is idle."""
+    """队列处理器守护线程：每 0.2s 检查 cron_queue。
+    队列有任务 + Agent 空闲（获取到 agent_lock）→ 唤醒 agent_loop 处理定时任务。
+    非阻塞锁确保不会打断正在运行的用户交互。"""
     global session_context
     while True:
         time.sleep(0.2)
@@ -790,6 +820,12 @@ def queue_processor_loop():
 
 
 if __name__ == "__main__":
+    # 交互入口。流程:
+    #   1. 打印欢迎信息
+    #   2. 启动 queue_processor_loop 守护线程
+    #   3. 循环读取用户输入（青色提示符 s14 >>）
+    #   4. 持锁调用 run_agent_turn_locked（防止与 cron 队列处理并发）
+    #   5. q/exit/空 → 退出
     print("s14: cron scheduler")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     threading.Thread(target=queue_processor_loop, daemon=True).start()
