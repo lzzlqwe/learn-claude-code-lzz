@@ -1,21 +1,25 @@
 #!/usr/bin/env python3
 """
-s16: Team Protocols — request-response protocol + request_id + dispatch + state machine.
+s16: Team Protocols — 团队协作协议，请求-响应模式 + request_id + 分发 + 状态机。
+核心模式（3 大协议机制）:
+  1. ProtocolState + pending_requests: request_id 追踪每次协议交互的状态
+  2. match_response: Lead 收件箱消费时自动关联响应到原始请求（含类型校验）
+  3. Teammate idle loop: 完成任务后不退出，等待收件箱中新协议消息（shutdown/plan_approval）
 
 Run:  python s16_team_protocols/code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
 
-Changes from s15:
-  - ProtocolState dataclass (request_id, type, sender, status, created_at)
-  - pending_requests dict: tracks in-flight protocol requests
-  - dispatch_message: routes incoming messages by type to handlers
-  - request_shutdown: Lead sends shutdown protocol request
-  - request_plan: Lead asks teammate to submit plan
-  - handle_shutdown_request / handle_plan_response: teammate receives & responds
-  - match_response: Lead correlates response to request via request_id (with type validation)
-  - Teammate idle loop: waits for inbox messages instead of exiting after 10 rounds
-  - Unified consume_lead_inbox: protocol routing + injection into history
-  - 3 new Lead tools: request_shutdown, request_plan, review_plan
+Changes from s15（相对于 s15 的变更）:
+  - ProtocolState dataclass: 协议状态数据类（request_id / type / sender / status / created_at）
+  - pending_requests dict: 追踪进行中的协议请求
+  - dispatch_message: 按消息类型路由到对应 handler
+  - request_shutdown: Lead 发送关机协议请求
+  - request_plan: Lead 要求 teammate 提交执行计划
+  - handle_shutdown_request / handle_plan_response: teammate 接收并响应
+  - match_response: Lead 通过 request_id 关联响应到请求（含类型校验）
+  - Teammate idle loop: 空闲时等待收件箱消息，不再 10 轮后退出
+  - Unified consume_lead_inbox: 协议路由 + 注入历史，统一入口
+  - 3 new Lead tools: request_shutdown / request_plan / review_plan
   - 1 new teammate tool: submit_plan
 
 ASCII flow:
@@ -48,7 +52,7 @@ MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12, synced) ──
+# ── Task System (from s12, synced) ── 任务系统（继承自 s12）──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -56,6 +60,7 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
+    """任务数据类。status: pending→in_progress→completed。blockedBy: 依赖的前置任务 ID 列表。"""
     id: str
     subject: str
     description: str
@@ -70,6 +75,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创建任务并持久化。ID = task_{timestamp}_{random}。"""
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -81,27 +87,29 @@ def create_task(subject: str, description: str = "",
 
 
 def save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+    """持久化任务到 .tasks/{id}.json。"""
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2), encoding="utf-8")
 
 
 def load_task(task_id: str) -> Task:
-    return Task(**json.loads(_task_path(task_id).read_text()))
+    """从 .tasks/{id}.json 加载任务。"""
+    return Task(**json.loads(_task_path(task_id).read_text(encoding="utf-8")))
 
 
 def list_tasks() -> list[Task]:
-    return [Task(**json.loads(p.read_text()))
+    """列出所有任务（按文件名排序）。"""
+    return [Task(**json.loads(p.read_text(encoding="utf-8")))
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
 def get_task(task_id: str) -> str:
-    """Return full task details as JSON."""
+    """返回任务完整 JSON 详情。"""
     task = load_task(task_id)
     return json.dumps(asdict(task), indent=2)
 
 
 def can_start(task_id: str) -> bool:
-    """Check if all blockedBy dependencies are completed.
-    Missing dependencies are treated as blocked."""
+    """检查所有 blockedBy 依赖是否已完成。缺失的依赖文件视为阻塞。"""
     task = load_task(task_id)
     for dep_id in task.blockedBy:
         if not _task_path(dep_id).exists():
@@ -142,7 +150,7 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Prompt Assembly (from s10, synced) ──
+# ── Prompt Assembly (from s10, synced) ── Prompt 组装（继承自 s10）──
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -156,6 +164,7 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
+    """根据 context 拼接 prompt。始终加载 identity/tools/workspace，按需加载 memory。"""
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -169,6 +178,7 @@ _last_context_key, _last_prompt = None, None
 
 
 def get_system_prompt(context: dict) -> str:
+    """带缓存的 prompt 获取。json.dumps 做确定性 key，避免相同 context 重复拼接。"""
     global _last_context_key, _last_prompt
     key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
     if key == _last_context_key and _last_prompt:
@@ -178,9 +188,10 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Tools ──
+# ── Tools ── 工具函数实现 ──
 
 def safe_path(p: str) -> Path:
+    """路径安全校验 —— 防止 LLM 通过 ../ 逃逸工作目录。"""
     path = (WORKDIR / p).resolve()
     if not path.is_relative_to(WORKDIR):
         raise ValueError(f"Path escapes workspace: {p}")
@@ -188,7 +199,8 @@ def safe_path(p: str) -> Path:
 
 
 def run_bash(command: str, run_in_background: bool = False) -> str:
-    # run_in_background is handled by agent_loop dispatch, not here
+    """执行 Shell 命令。120 秒超时 + 输出截断至 50000 字符。
+    run_in_background 由 agent_loop 调度层处理，此处不做后台执行。"""
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -199,8 +211,9 @@ def run_bash(command: str, run_in_background: bool = False) -> str:
 
 
 def run_read(path: str, limit: int | None = None) -> str:
+    """读取文件内容。参数: path=文件路径, limit=可选行数限制。"""
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -209,16 +222,17 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    """写入内容到文件。自动创建父目录。"""
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
-# Task tools
+# Task tools ── 任务工具函数 ──
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -258,7 +272,7 @@ def run_complete_task(task_id: str) -> str:
     return complete_task(task_id)
 
 
-# ── Background Tasks (from s13, synced) ──
+# ── Background Tasks (from s13, synced) ── 后台任务（继承自 s13）──
 
 _bg_counter = 0
 background_tasks: dict[str, dict] = {}
@@ -267,7 +281,7 @@ background_lock = threading.Lock()
 
 
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    """Fallback heuristic: commands likely to take > 30s."""
+    """启发式兜底：命令关键词匹配，判断是否可能耗时 > 30s。"""
     if tool_name != "bash":
         return False
     cmd = tool_input.get("command", "").lower()
@@ -278,14 +292,14 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
 
 
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
+    """两条判断路径：1. 模型显式请求 → 直接后台  2. 关键词启发式兜底。"""
     if tool_input.get("run_in_background"):
         return True
     return is_slow_operation(tool_name, tool_input)
 
 
 def start_background_task(block) -> str:
-    """Run tool in a daemon thread. Returns background task ID."""
+    """在 daemon 线程中执行工具。注册 bg_id → 启动线程 → 立即返回占位符。"""
     global _bg_counter
     _bg_counter += 1
     bg_id = f"bg_{_bg_counter:04d}"
@@ -309,7 +323,8 @@ def start_background_task(block) -> str:
 
 
 def collect_background_results() -> list[str]:
-    """Collect completed background results as task_notification messages."""
+    """收集已完成的 background 结果，pop 后格式化为 <task_notification> XML。
+    pop 确保不会重复注入。"""
     with background_lock:
         ready_ids = [bid for bid, task in background_tasks.items()
                      if task["status"] == "completed"]
@@ -331,16 +346,16 @@ def collect_background_results() -> list[str]:
     return notifications
 
 
-# ── MessageBus (from s15) ──
+# ── MessageBus (from s15) ── 消息总线（继承自 s15）──
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
 
 
 class MessageBus:
-    """File-based message bus. Each agent has a .jsonl inbox.
-    Read is destructive: read_text + unlink (consumes messages).
-    Teaching version: no file locking; real CC uses proper-lockfile."""
+    """基于文件的消息总线。每个 Agent 有一个 .jsonl 收件箱。
+    读取即消费：read_text + unlink（取走就删除）。
+    教学版无文件锁；真实 CC 使用 proper-lockfile 保证并发安全。"""
 
     def send(self, from_agent: str, to_agent: str, content: str,
              msg_type: str = "message", metadata: dict = None):
@@ -357,19 +372,24 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+        msgs = [json.loads(line) for line in inbox.read_text(encoding="utf-8").splitlines()
                 if line.strip()]
-        inbox.unlink()  # consume: read + delete
+        inbox.unlink()  # 消费：先读后删（consume: read + delete）
         return msgs
 
 
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State (s16 new) ──
+# ── Protocol State (s16 new) ── 协议状态管理（s16 新增）──
 
 @dataclass
 class ProtocolState:
+    """协议状态数据类。
+    type: shutdown | plan_approval
+    status: pending → approved | rejected
+    request_id: 唯一请求 ID，用于关联请求和响应
+    """
     request_id: str
     type: str       # "shutdown" | "plan_approval"
     sender: str
@@ -387,13 +407,13 @@ def new_request_id() -> str:
 
 
 def match_response(response_type: str, request_id: str, approve: bool):
-    """Correlate a response to the original request via request_id.
-    Validates that response_type matches the request type."""
+    """通过 request_id 关联响应到原始请求。
+    校验 response_type 与请求类型匹配 + 防重复处理。"""
     state = pending_requests.get(request_id)
     if not state:
         print(f"  \033[31m[protocol] unknown request_id: {request_id}\033[0m")
         return
-    # Validate response type matches request type
+    # 校验响应类型与请求类型匹配（Validate response type matches request type）
     if state.type == "shutdown" and response_type != "shutdown_response":
         print(f"  \033[31m[protocol] type mismatch: expected shutdown_response, "
               f"got {response_type}\033[0m")
@@ -413,14 +433,13 @@ def match_response(response_type: str, request_id: str, approve: bool):
           f"({request_id}: {state.status})\033[0m")
 
 
-# ── Unified Lead Inbox Consumer (s16 fix) ──
-# Both check_inbox tool and main loop call this function.
-# Protocol responses are routed via match_response before returning.
+# ── Unified Lead Inbox Consumer (s16 fix) ── 统一收件箱消费（s16 修复）──
+# check_inbox 工具和主循环都调用此函数。
+# 协议响应在返回前通过 match_response 路由处理。
 
 def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
-    """Read Lead's inbox. Route protocol responses, return all messages.
-    Called by both run_check_inbox() and main loop to avoid
-    messages being consumed without protocol routing."""
+    """读取 Lead 收件箱。自动路由协议响应 → 返回所有消息。
+    check_inbox 工具和主循环共用此函数，防止消息被消费但未路由协议。"""
     msgs = BUS.read_inbox("lead")
     if not msgs:
         return []
@@ -435,12 +454,12 @@ def consume_lead_inbox(route_protocol: bool = True) -> list[dict]:
     return msgs
 
 
-# ── Teammate Thread (s16: idle loop + dispatch) ──
+# ── Teammate Thread (s16: idle loop + dispatch) ── Teammate 线程（s16：空闲循环 + 分发）──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
-    """Spawn a teammate agent in a background thread.
-    Uses idle loop: after each LLM turn, waits for inbox messages
-    (shutdown_request, new task) instead of exiting."""
+    """在后台线程中创建 teammate Agent（s16 升级版）。
+    使用 idle loop：完成 LLM turn 后不退出，等待收件箱中的协议消息。
+    支持 shutdown_request（优雅退出）和 plan_approval_response（计划审批）。"""
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
@@ -449,8 +468,9 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
               f"Check inbox for protocol messages (shutdown_request, etc).")
 
     def handle_inbox_message(name: str, msg: dict, messages: list) -> bool:
-        """Dispatch incoming protocol messages by type.
-        Returns True if teammate should stop."""
+        """按消息类型分发处理。返回 True 表示 teammate 应停止。
+        shutdown_request → 发送 approval 回复 + 停止
+        plan_approval_response → 注入审批结果到 messages"""
         msg_type = msg.get("type", "message")
         meta = msg.get("metadata", {})
         req_id = meta.get("request_id", "")
@@ -511,7 +531,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
         shutdown_requested = False
         while not shutdown_requested:
-            # Check inbox for protocol messages
+            # 检查收件箱中的协议消息（Check inbox for protocol messages）
             inbox = BUS.read_inbox(name)
             should_stop = False
             non_protocol = []
@@ -540,8 +560,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
             messages.append({"role": "assistant", "content": response.content})
             if response.stop_reason != "tool_use":
-                # Idle: wait for inbox messages instead of exiting
-                # Real CC sends idle_notification to Lead here
+                # 空闲状态：等待收件箱消息而非退出（Idle: wait for inbox instead of exiting）
+                # 真实 CC 在此发送 idle_notification 给 Lead
                 while not shutdown_requested:
                     time.sleep(1)
                     inbox = BUS.read_inbox(name)
@@ -563,7 +583,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                             "content": "<inbox>" + inbox_json + "</inbox>"})
                         break  # back to LLM turn with new messages
 
-            # Execute tool calls
+            # 执行工具调用（Execute tool calls）
             results = []
             for block in response.content:
                 if block.type == "tool_use":
@@ -574,7 +594,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
                                     "content": str(output)})
             messages.append({"role": "user", "content": results})
 
-        # Send final summary to Lead
+        # 发送最终结果给 Lead（Send final summary to Lead）
         summary = "Done."
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
@@ -596,15 +616,8 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
 
 def _teammate_submit_plan(from_name: str, plan: str) -> str:
-    """Teammate submits a plan to Lead for approval.
-
-    Note: This is a protocol-level request, not a code-level gate.
-    After submitting, the teammate's thread continues running — it can
-    still call bash/write/etc. Real enforcement relies on the model
-    waiting for the approval response before acting. Code-level tool
-    gating would require blocking the teammate's tool dispatch until
-    approval arrives.
-    """
+    """Teammate 提交计划给 Lead 审批。
+    此为协议级请求（非代码级门禁）。提交后 teammate 线程继续运行。"""
     req_id = new_request_id()
     pending_requests[req_id] = ProtocolState(
         request_id=req_id, type="plan_approval",
@@ -616,7 +629,7 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     return f"Plan submitted ({req_id}). Waiting for approval..."
 
 
-# ── Lead Protocol Tools (s16 new) ──
+# ── Lead Protocol Tools (s16 new) ── Lead 协议工具（s16 新增）──
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -633,7 +646,7 @@ def run_request_shutdown(teammate: str) -> str:
 
 
 def run_request_plan(teammate: str, task: str) -> str:
-    """Lead asks a teammate to submit a plan for a task."""
+    """Lead 要求 teammate 提交执行计划。"""
     BUS.send("lead", teammate, f"Please submit a plan for: {task}",
              "message")
     return f"Asked {teammate} to submit a plan"
@@ -654,7 +667,7 @@ def run_review_plan(request_id: str, approve: bool, feedback: str = "") -> str:
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
-# ── Other Lead Tool Handlers ──
+# ── Other Lead Tool Handlers ── 其他 Lead 工具处理函数 ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
     return spawn_teammate_thread(name, role, prompt)
@@ -666,7 +679,7 @@ def run_send_message(to: str, content: str) -> str:
 
 
 def run_check_inbox() -> str:
-    """Check Lead's inbox. Routes protocol responses via match_response."""
+    """检查 Lead 收件箱。自动路由协议响应。"""
     msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
         return "(inbox empty)"
@@ -679,10 +692,10 @@ def run_check_inbox() -> str:
     return "\n".join(lines)
 
 
-# ── Tool Dispatch ──
+# ── Tool Dispatch ── 工具分发 ──
 
 def execute_tool(block) -> str:
-    """Execute a tool call block, return output."""
+    """执行工具调用 block，返回输出。根据 block.name 路由到对应 handler。"""
     handler = {
         "bash": run_bash, "read_file": run_read, "write_file": run_write,
         "create_task": run_create_task, "list_tasks": run_list_tasks,
@@ -698,7 +711,7 @@ def execute_tool(block) -> str:
     return f"Unknown tool: {block.name}"
 
 
-# ── Tool Definitions ──
+# ── Tool Definitions ── 工具 Schema 定义 ──
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -785,13 +798,13 @@ TOOLS = [
 ]
 
 
-# ── Context ──
+# ── Context ── 上下文管理 ──
 
 def update_context(context: dict, messages: list) -> dict:
-    """Derive context from real state."""
+    """根据真实状态更新上下文：工具列表 / 工作目录 / 记忆索引。"""
     memories = ""
     if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
+        content = MEMORY_INDEX.read_text(encoding="utf-8").strip()
         if content:
             memories = content
     return {
@@ -801,9 +814,15 @@ def update_context(context: dict, messages: list) -> dict:
     }
 
 
-# ── Agent Loop ──
+# ── Agent Loop ── Agent 主循环 ──
 
 def agent_loop(messages: list, context: dict):
+    """Agent 主循环。流程：
+    1. 调用 LLM → 获取响应
+    2. 分流工具执行：后台（daemon 线程）或 同步
+    3. 合并后台通知 + 工具结果 → 追加消息
+    4. 循环直到 stop_reason != tool_use
+    """
     system = get_system_prompt(context)
     while True:
         try:
@@ -824,7 +843,7 @@ def agent_loop(messages: list, context: dict):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"\033[36m> {block.name}\033[0m")
+            print(f"\033[33m> {block.name}\033[0m")
 
             if should_run_background(block.name, block.input):
                 bg_id = start_background_task(block)
@@ -834,24 +853,29 @@ def agent_loop(messages: list, context: dict):
                                            f"Result will be available when complete."})
             else:
                 output = execute_tool(block)
-                print(str(output)[:300])
+                print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{str(output)[:300]}\033[0m")
                 results.append({"type": "tool_result",
                                 "tool_use_id": block.id,
                                 "content": output})
 
-        # Merge background notifications + tool results into one user message
-        user_content = []
+        # 合并后台通知 + 工具结果到同一条 user 消息（Merge bg notifications + tool results）
+        user_content = list(results)
         bg_notifications = collect_background_results()
         if bg_notifications:
             for notif in bg_notifications:
                 user_content.append({"type": "text", "text": notif})
-        user_content.extend(results)
         messages.append({"role": "user", "content": user_content})
         context = update_context(context, messages)
         system = get_system_prompt(context)
 
 
 if __name__ == "__main__":
+    # 交互入口。流程:
+    #   1. 打印欢迎信息
+    #   2. 循环读取用户输入（青色提示符 s16 >>）
+    #   3. 进入 agent_loop（支持 protocol 工具）
+    #   4. agent_loop 返回后：consume_lead_inbox 路由协议 + 注入 teammate 结果
+    #   5. q/exit/空 → 退出
     print("s16: team protocols")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
@@ -868,9 +892,9 @@ if __name__ == "__main__":
         context = update_context(context, history)
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
-                print(block.text)
+                print(f"\033[34m{block.text}\033[0m")
 
-        # Check inbox → route protocol + inject into history
+        # 检查收件箱 → 路由协议 + 注入历史（Check inbox → route protocol + inject into history）
         inbox_msgs = consume_lead_inbox(route_protocol=True)
         if inbox_msgs:
             inbox_text = "\n".join(
