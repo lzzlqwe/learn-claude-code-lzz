@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-s18: Worktree Isolation — git worktree + task-directory binding + event log.
+s18: Worktree Isolation — git worktree 隔离 + 任务-目录绑定 + 事件日志。
+核心模式（3 大隔离机制）:
+  1. git worktree: 每个任务有独立的 git 分支和工作目录，互不干扰
+  2. Task.worktree 绑定: 任务 JSON 中记录绑定的 worktree 名，teammate 自动切换 cwd
+  3. events.jsonl: 记录 worktree 生命周期事件（create/remove/keep）
 
 Run:  python s18_worktree_isolation/code.py
 Need: pip install anthropic python-dotenv + .env with ANTHROPIC_API_KEY
@@ -48,7 +52,7 @@ WORKDIR = Path.cwd()
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-# ── Task System (from s12 + s18 worktree field) ──
+# ── Task System (from s12 + s18 worktree field) ── 任务系统（s12 + s18 worktree 字段）──
 
 TASKS_DIR = WORKDIR / ".tasks"
 TASKS_DIR.mkdir(exist_ok=True)
@@ -56,13 +60,14 @@ TASKS_DIR.mkdir(exist_ok=True)
 
 @dataclass
 class Task:
+    """任务数据类。s18 新增 worktree 字段，绑定到 git worktree 隔离目录。"""
     id: str
     subject: str
     description: str
-    status: str
-    owner: str | None
-    blockedBy: list[str]
-    worktree: str | None = None      # s18: bound worktree name
+    status: str          # pending | in_progress | completed
+    owner: str | None    # Agent 名称（多 Agent 场景用）
+    blockedBy: list[str] # 依赖的前置任务 ID 列表
+    worktree: str | None = None      # s18: 绑定的 worktree 名称
 
 
 def _task_path(task_id: str) -> Path:
@@ -71,6 +76,7 @@ def _task_path(task_id: str) -> Path:
 
 def create_task(subject: str, description: str = "",
                 blockedBy: list[str] | None = None) -> Task:
+    """创建任务并持久化。ID = task_{timestamp}_{random}。"""
     task = Task(
         id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
         subject=subject, description=description,
@@ -82,15 +88,18 @@ def create_task(subject: str, description: str = "",
 
 
 def save_task(task: Task):
-    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+    """持久化任务到 .tasks/{id}.json。"""
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2), encoding="utf-8")
 
 
 def load_task(task_id: str) -> Task:
-    return Task(**json.loads(_task_path(task_id).read_text()))
+    """从 .tasks/{id}.json 加载任务。"""
+    return Task(**json.loads(_task_path(task_id).read_text(encoding="utf-8")))
 
 
 def list_tasks() -> list[Task]:
-    return [Task(**json.loads(p.read_text()))
+    """列出所有任务（按文件名排序）。"""
+    return [Task(**json.loads(p.read_text(encoding="utf-8")))
             for p in sorted(TASKS_DIR.glob("task_*.json"))]
 
 
@@ -145,7 +154,7 @@ def complete_task(task_id: str) -> str:
     return msg
 
 
-# ── Worktree System (s18 new) ──
+# ── Worktree System (s18 new) ── Worktree 隔离系统（s18 新增）──
 
 WORKTREES_DIR = WORKDIR / ".worktrees"
 WORKTREES_DIR.mkdir(exist_ok=True)
@@ -154,7 +163,7 @@ VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
 
 
 def validate_worktree_name(name: str) -> str | None:
-    """Return error message if invalid, None if valid."""
+    """校验 worktree 名称。拒绝路径遍历（./..）和非法字符，仅允许 [A-Za-z0-9._-]{1,64}。"""
     if not name:
         return "Worktree name cannot be empty"
     if name == "." or name == "..":
@@ -166,7 +175,7 @@ def validate_worktree_name(name: str) -> str | None:
 
 
 def run_git(args: list[str]) -> tuple[bool, str]:
-    """Run git command. Return (ok, output)."""
+    """执行 git 命令。返回 (ok, output)。30 秒超时 + 输出截断至 5000 字符。"""
     try:
         r = subprocess.run(["git"] + args, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=30)
@@ -178,7 +187,7 @@ def run_git(args: list[str]) -> tuple[bool, str]:
 
 
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
-    """Append a lifecycle event to events.jsonl."""
+    """追加生命周期事件到 events.jsonl。类型: create/remove/keep。"""
     event = {"type": event_type, "worktree": worktree_name,
              "task_id": task_id, "ts": time.time()}
     events_file = WORKTREES_DIR / "events.jsonl"
@@ -187,7 +196,7 @@ def log_event(event_type: str, worktree_name: str, task_id: str = ""):
 
 
 def create_worktree(name: str, task_id: str = "") -> str:
-    """Create a git worktree with a dedicated branch. Optionally bind to a task."""
+    """创建 git worktree（独立分支 wt/{name}）。可选绑定到任务。"""
     err = validate_worktree_name(name)
     if err:
         return f"Error: {err}"
@@ -205,7 +214,7 @@ def create_worktree(name: str, task_id: str = "") -> str:
 
 
 def bind_task_to_worktree(task_id: str, worktree_name: str):
-    """Write worktree field to task. Keep status as pending for auto-claim."""
+    """绑定任务到 worktree。仅写 worktree 字段，保持 status=pending 供自动认领。"""
     task = load_task(task_id)
     task.worktree = worktree_name
     save_task(task)
@@ -213,7 +222,7 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
 
 
 def _count_worktree_changes(path: Path) -> tuple[int, int]:
-    """Count uncommitted files and commits in a worktree."""
+    """统计 worktree 中未提交的文件和提交。"""
     try:
         r1 = subprocess.run(["git", "status", "--porcelain"],
                             cwd=path, capture_output=True, text=True, timeout=10)
@@ -227,7 +236,7 @@ def _count_worktree_changes(path: Path) -> tuple[int, int]:
 
 
 def remove_worktree(name: str, discard_changes: bool = False) -> str:
-    """Remove worktree. Refuses if uncommitted changes unless discard_changes."""
+    """删除 worktree。有未提交变更时拒绝删除，除非 discard_changes=true。"""
     err = validate_worktree_name(name)
     if err:
         return err
@@ -254,7 +263,7 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
 
 
 def keep_worktree(name: str) -> str:
-    """Keep worktree for manual review. Branch preserved."""
+    """保留 worktree 供人工审查。分支 wt/{name} 保留不删除。"""
     err = validate_worktree_name(name)
     if err:
         return err
@@ -263,7 +272,7 @@ def keep_worktree(name: str) -> str:
     return f"Worktree '{name}' kept for review (branch: wt/{name})"
 
 
-# ── Prompt Assembly (from s10) ──
+# ── Prompt Assembly (from s10) ── Prompt 组装（继承自 s10）──
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
@@ -278,6 +287,7 @@ PROMPT_SECTIONS = {
 
 
 def assemble_system_prompt(context: dict) -> str:
+    """根据 context 拼接 prompt。始终加载 identity/tools/workspace，按需加载 memory。"""
     sections = [PROMPT_SECTIONS["identity"],
                 PROMPT_SECTIONS["tools"],
                 PROMPT_SECTIONS["workspace"]]
@@ -290,6 +300,7 @@ _last_context_hash, _last_prompt = None, None
 
 
 def get_system_prompt(context: dict) -> str:
+    """带缓存的 prompt 获取。json.dumps 做确定性 key，避免相同 context 重复拼接。"""
     global _last_context_hash, _last_prompt
     h = json.dumps(context, sort_keys=True)
     if h == _last_context_hash and _last_prompt:
@@ -298,9 +309,10 @@ def get_system_prompt(context: dict) -> str:
     return _last_prompt
 
 
-# ── Basic Tools ──
+# ── Basic Tools ── 基础工具函数 ──
 
 def safe_path(p: str, cwd: Path = None) -> Path:
+    """路径安全校验 —— 防止 LLM 通过 ../ 逃逸工作目录。支持自定义 cwd（worktree 目录）。"""
     base = cwd or WORKDIR
     path = (base / p).resolve()
     if not path.is_relative_to(base):
@@ -309,6 +321,7 @@ def safe_path(p: str, cwd: Path = None) -> Path:
 
 
 def run_bash(command: str, cwd: Path = None) -> str:
+    """执行 Shell 命令。120 秒超时 + 输出截断至 50000 字符。支持 cwd 参数指定工作目录。"""
     try:
         r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
                            capture_output=True, text=True, timeout=120)
@@ -319,8 +332,9 @@ def run_bash(command: str, cwd: Path = None) -> str:
 
 
 def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
+    """读取文件内容。参数: path=文件路径, limit=可选行数限制, cwd=工作目录。"""
     try:
-        lines = safe_path(path, cwd).read_text().splitlines()
+        lines = safe_path(path, cwd).read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
@@ -329,16 +343,17 @@ def run_read(path: str, limit: int | None = None, cwd: Path = None) -> str:
 
 
 def run_write(path: str, content: str, cwd: Path = None) -> str:
+    """写入内容到文件。自动创建父目录。支持 cwd 参数指定工作目录。"""
     try:
         fp = safe_path(path, cwd)
         fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content)
+        fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 
 
-# ── MessageBus (from s15) ──
+# ── MessageBus (from s15) ── 消息总线（继承自 s15）──
 
 MAILBOX_DIR = WORKDIR / ".mailboxes"
 MAILBOX_DIR.mkdir(exist_ok=True)
@@ -360,7 +375,7 @@ class MessageBus:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
-        msgs = [json.loads(line) for line in inbox.read_text().splitlines()
+        msgs = [json.loads(line) for line in inbox.read_text(encoding="utf-8").splitlines()
                 if line.strip()]
         inbox.unlink()
         return msgs
@@ -369,10 +384,11 @@ class MessageBus:
 BUS = MessageBus()
 active_teammates: dict[str, bool] = {}
 
-# ── Protocol State (from s16) ──
+# ── Protocol State (from s16) ── 协议状态管理（继承自 s16）──
 
 @dataclass
 class ProtocolState:
+    """协议状态数据类。type: shutdown / plan_approval。status: pending → approved / rejected。"""
     request_id: str
     type: str
     sender: str
@@ -410,6 +426,7 @@ def match_response(response_type: str, request_id: str, approve: bool):
 
 
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
+    """读取 Lead 收件箱。自动路由协议响应 → 返回所有消息。"""
     msgs = BUS.read_inbox("lead")
     if route_protocol:
         for msg in msgs:
@@ -421,17 +438,17 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
     return msgs
 
 
-# ── Autonomous Agent (from s17, + worktree cwd) ──
+# ── Autonomous Agent (from s17, + worktree cwd) ── 自主 Agent（s17 + worktree cwd）──
 
 IDLE_POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 
 
 def scan_unclaimed_tasks() -> list[dict]:
-    """Find pending, unowned tasks with all dependencies completed."""
+    """扫描任务板：找 status=pending、无 owner、依赖已全部完成的待办任务。"""
     unclaimed = []
     for f in sorted(TASKS_DIR.glob("task_*.json")):
-        task = json.loads(f.read_text())
+        task = json.loads(f.read_text(encoding="utf-8"))
         if (task.get("status") == "pending"
                 and not task.get("owner")
                 and can_start(task["id"])):
@@ -441,7 +458,9 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 def idle_poll(agent_name: str, messages: list,
               name: str, role: str) -> str:
-    """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
+    """空闲轮询（60s/5s 间隔）。返回 'work'（有新任务/消息）、
+    'shutdown'（收到关机协议）、'timeout'（60s 无任务超时退出）。
+    自动认领时注入 worktree 路径信息。"""
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
@@ -484,9 +503,11 @@ def idle_poll(agent_name: str, messages: list,
     return "timeout"
 
 
-# ── Teammate Thread (from s15 + s16 + s17 + s18) ──
+# ── Teammate Thread (from s15 + s16 + s17 + s18) ── Teammate 线程（s15+s16+s17+s18 融合）──
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
+    """在后台线程中创建自主 Agent（s18 升级版）。
+    支持 wt_ctx 跟踪当前 worktree cwd，bash/read/write 自动在 worktree 目录执行。"""
     if name in active_teammates:
         return f"Teammate '{name}' already exists"
 
@@ -519,7 +540,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         return False
 
     def run():
-        # Track current worktree for this teammate's cwd
+        # 跟踪当前 teammate 的 worktree 工作目录（Track current worktree cwd）
         wt_ctx = {"path": None}
 
         def _wt_cwd() -> Path | None:
@@ -547,7 +568,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         def _run_claim_task(task_id: str):
             result = claim_task(task_id, owner=name)
             if "Claimed" in result:
-                # Set worktree cwd if task has one
+                # 如果任务绑定了 worktree，设置 cwd（Set worktree cwd if task has one）
                 task = load_task(task_id)
                 if task.worktree:
                     wt_ctx["path"] = str(WORKTREES_DIR / task.worktree)
@@ -613,7 +634,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             "complete_task": _run_complete_task,
         }
 
-        # Outer loop: WORK → IDLE cycle
+        # 外层循环：WORK → IDLE 周期（Outer loop: WORK → IDLE cycle）
         while True:
             if len(messages) <= 3:
                 messages.insert(0, {"role": "user",
@@ -667,7 +688,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
             if idle_result == "timeout":
                 break
 
-        # Summary
+        # 提取最终摘要（Summary）
         summary = "Done."
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
@@ -700,7 +721,7 @@ def _teammate_submit_plan(from_name: str, plan: str) -> str:
     return f"Plan submitted ({req_id}). Waiting for approval..."
 
 
-# ── Lead Protocol Tools (from s16) ──
+# ── Lead Protocol Tools (from s16) ── Lead 协议工具（继承自 s16）──
 
 def run_request_shutdown(teammate: str) -> str:
     req_id = new_request_id()
@@ -739,7 +760,7 @@ def run_review_plan(request_id: str, approve: bool,
     return f"Plan {'approved' if approve else 'rejected'} ({request_id})"
 
 
-# ── Lead Worktree Tools (s18 new) ──
+# ── Lead Worktree Tools (s18 new) ── Lead Worktree 工具（s18 新增）──
 
 def run_create_worktree(name: str, task_id: str = "") -> str:
     return create_worktree(name, task_id)
@@ -753,7 +774,7 @@ def run_keep_worktree(name: str) -> str:
     return keep_worktree(name)
 
 
-# ── Basic tool handlers ──
+# ── Basic tool handlers ── 基础工具处理函数 ──
 
 def run_create_task(subject: str, description: str = "",
                     blockedBy: list[str] | None = None) -> str:
@@ -807,7 +828,7 @@ def run_check_inbox() -> str:
     return "\n".join(lines)
 
 
-# ── Tool Definitions ──
+# ── Tool Definitions ── 工具 Schema 定义 ──
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
@@ -920,22 +941,25 @@ TOOL_HANDLERS = {
 }
 
 
-# ── Context ──
+# ── Context ── 上下文管理 ──
 
 MEMORY_DIR = WORKDIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 
 
 def update_context(context: dict, messages: list) -> dict:
+    """根据真实状态更新上下文。从 MEMORY_INDEX 读取记忆（截断 2000 字符）。"""
     memories = ""
     if MEMORY_INDEX.exists():
-        memories = MEMORY_INDEX.read_text()[:2000]
+        memories = MEMORY_INDEX.read_text(encoding="utf-8")[:2000]
     return {"memories": memories}
 
 
-# ── Agent Loop ──
+# ── Agent Loop ── Agent 主循环 ──
 
 def agent_loop(messages: list, context: dict):
+    """Agent 主循环。流程：LLM 调用 → 工具执行 → 追加结果 → 循环。
+    s18 简化版，worktree 操作由 Lead 工具完成。"""
     system = get_system_prompt(context)
     while True:
         try:
@@ -955,10 +979,10 @@ def agent_loop(messages: list, context: dict):
         for block in response.content:
             if block.type != "tool_use":
                 continue
-            print(f"\033[36m> {block.name}\033[0m")
+            print(f"\033[33m> {block.name}\033[0m")
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else "Unknown"
-            print(str(output)[:300])
+            print(f"\033[1;35m[{block.name} -> Tool Calling Result]\033[0m \033[35m{str(output)[:300]}\033[0m")
             results.append({"type": "tool_result",
                             "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
@@ -967,6 +991,11 @@ def agent_loop(messages: list, context: dict):
 
 
 if __name__ == "__main__":
+    # 交互入口。流程:
+    #   1. 打印欢迎信息
+    #   2. 循环读取用户输入（青色提示符 s18 >>）
+    #   3. agent_loop + consume_lead_inbox 收协议响应
+    #   4. q/exit/空 → 退出
     print("s18: worktree isolation")
     print("Enter a question, press Enter to send. Type q to quit.\n")
     history = []
@@ -983,9 +1012,9 @@ if __name__ == "__main__":
         context = update_context(context, history)
         for block in history[-1]["content"]:
             if getattr(block, "type", None) == "text":
-                print(block.text)
+                print(f"\033[34m{block.text}\033[0m")
 
-        # Consume lead inbox: route protocol + inject into history
+        # 消费 Lead 收件箱：路由协议 + 注入历史（Consume lead inbox）
         inbox = consume_lead_inbox(route_protocol=True)
         if inbox:
             inbox_text = "\n".join(
