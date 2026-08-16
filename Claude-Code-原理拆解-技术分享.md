@@ -1,16 +1,18 @@
 # Claude Code 实现原理拆解：一个 Agent Harness 的 20 层结构
 
-> 本文基于 `learn-claude-code` 项目的 20 章可运行代码（`s01_agent_loop/` ~ `s20_comprehensive/`）整理，按章节顺序讲清 Claude Code 这类编程 Agent 的内部机制。每一节的结构是：**这一层解决什么问题 → 怎么实现 → 关键代码 → 工程取舍 → 教学版与生产版的差距**。
+> 试用期期间的一项目标是熟悉团队在用的 AI 编程工具与开发流程。日常用 Claude Code 写代码时，我对它内部到底怎么运转产生了兴趣——为什么它能连续跑几十轮不跑偏、上下文满了之后发生了什么、多个 Agent 并行改代码为什么不互相覆盖。于是花了一段时间把这类编程 Agent 的实现机制做了一次系统拆解，本文是这次学习的整理输出。
 >
-> 阅读本文不需要机器学习背景，只需要能读 Python。所有代码片段均来自项目内可运行的 `code.py`。
+> 全文按 20 个机制层次组织，每一节的结构是：**这一层解决什么问题 → 怎么实现 → 关键代码 → 工程取舍 → 简化实现与生产实现的差距**。
+>
+> 说明：文中代码是为说明原理而写的最小化复现（Python），不是 Claude Code 源码。真实实现的复杂度在每一节末尾单独说明。阅读不需要机器学习背景，能读 Python 即可。
 
 ---
 
-## 0. 先对齐一个前提：Agent 的智能不在我们的代码里
+## 0. 先对齐一个前提：Agent 的智能不在编排代码里
 
 讨论实现之前，先把边界划清楚，否则很容易把工作方向搞错。
 
-**感知、推理、决策的能力（agency）来自模型训练，不来自外部编排代码。** 我们写的这一层叫 **harness**（载具）：给模型一套可操作的环境。
+**感知、推理、决策的能力（agency）来自模型训练，不来自外部编排代码。** 外面这一层叫 **harness**（载具），职责是给模型一套可操作的环境。
 
 ```
 Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
@@ -26,7 +28,7 @@ Harness = Tools + Knowledge + Observation + Action Interfaces + Permissions
 
 这个区分有很实际的意义：**它决定了出问题时该往哪儿改**。Agent 干活跑偏，通常不是"提示词不够长"，而是 harness 缺了某一层能力——它看不到该看的信息（上下文管理缺失）、没有该有的工具（能力边界缺失）、或者没有把目标持久化下来（任务系统缺失）。
 
-反过来说，用 if-else 分支、节点图、硬编码路由去"模拟"智能的那类工作流编排，本质是把符号规则系统重新包装一遍。它不具备泛化能力，而且随着分支增长会迅速变得不可维护。Claude Code 的做法恰恰相反：**它没有替模型做判断，只是把工具、知识、上下文和权限边界准备好，然后让开。**
+反过来说，用 if-else 分支、节点图、硬编码路由去"模拟"智能的那类工作流编排，本质是把符号规则系统重新包装一遍，随着分支增长会迅速变得不可维护，而且不具备泛化能力。Claude Code 的做法恰恰相反：**它没有替模型做判断，只是把工具、知识、上下文和权限边界准备好，然后让开。**
 
 把 Claude Code 剥到本质：
 
@@ -48,45 +50,45 @@ Claude Code = 一个 agent loop
 
 ## 阅读地图
 
-20 章按能力分成 6 个阶段，每一章只加一个机制，主循环本身几乎不动：
+20 个机制按能力递进分成 6 个阶段，每一层只加一件事，主循环本身几乎不动：
 
-| 阶段 | 章节 | 加了什么 |
+| 阶段 | 机制 | 加了什么 |
 |---|---|---|
-| 一、能动手 | s01 Agent Loop / s02 Tool Use / s03 Permission / s04 Hooks | 循环、工具分发、权限闸门、扩展插口 |
-| 二、能做复杂任务 | s05 TodoWrite / s06 Subagent / s07 Skill Loading / s08 Context Compact | 先计划、上下文隔离、知识按需加载、压缩腾地方 |
-| 三、能记住和恢复 | s09 Memory / s10 System Prompt / s11 Error Recovery | 跨会话记忆、运行时组装提示词、错误重试 |
-| 四、能长期运行 | s12 Task System / s13 Background Tasks / s14 Cron Scheduler | 持久化任务图、后台线程、定时触发 |
-| 五、能协作 | s15 Agent Teams / s16 Team Protocols / s17 Autonomous Agents / s18 Worktree Isolation | 队友+邮箱、请求-响应协议、自主认领、目录隔离 |
-| 六、能扩展并合体 | s19 MCP Plugin / s20 Comprehensive | 外部工具接入、全机制归一个循环 |
+| 一、能动手 | 01 Agent Loop / 02 Tool Use / 03 Permission / 04 Hooks | 循环、工具分发、权限闸门、扩展插口 |
+| 二、能做复杂任务 | 05 TodoWrite / 06 Subagent / 07 Skill Loading / 08 Context Compact | 先计划、上下文隔离、知识按需加载、压缩腾地方 |
+| 三、能记住和恢复 | 09 Memory / 10 System Prompt / 11 Error Recovery | 跨会话记忆、运行时组装提示词、错误重试 |
+| 四、能长期运行 | 12 Task System / 13 Background Tasks / 14 Cron Scheduler | 持久化任务图、后台线程、定时触发 |
+| 五、能协作 | 15 Agent Teams / 16 Team Protocols / 17 Autonomous Agents / 18 Worktree Isolation | 队友+邮箱、请求-响应协议、自主认领、目录隔离 |
+| 六、能扩展并合体 | 19 MCP Plugin / 20 综合架构 | 外部工具接入、全机制归一个循环 |
 
 一句话记住每一层的定位：
 
-| 章节 | 一句话 |
+| 机制 | 一句话 |
 |---|---|
-| s01 | 一个循环 + 一个 bash 就是一个 agent |
-| s02 | 加工具只加一个 handler，循环不动 |
-| s03 | 先划边界，再给自由 |
-| s04 | 扩展挂在循环上，不写进循环里 |
-| s05 | 没有计划的 agent 走哪算哪 |
-| s06 | 大任务拆小，每个小任务干净的上下文 |
-| s07 | 用到时再加载，别全塞进 prompt |
-| s08 | 上下文总会满，要有办法腾地方 |
-| s09 | 压缩会丢细节，要有一层不丢的 |
-| s10 | prompt 是组装出来的，不是写死的 |
-| s11 | 错误不是终点，是重试的起点 |
-| s12 | 大目标拆成小任务，排好序，落盘 |
-| s13 | 慢操作丢后台，agent 继续思考 |
-| s14 | 定时触发，不需要人推 |
-| s15 | 一个搞不定，组队来 |
-| s16 | 队友之间要有约定 |
-| s17 | 队友自己看板，有活就认领 |
-| s18 | 各干各的目录，互不干扰 |
-| s19 | 能力不够，插上 MCP |
-| s20 | 机制很多，循环一个 |
+| 01 | 一个循环 + 一个 bash 就是一个 agent |
+| 02 | 加工具只加一个 handler，循环不动 |
+| 03 | 先划边界，再给自由 |
+| 04 | 扩展挂在循环上，不写进循环里 |
+| 05 | 没有计划的 agent 走哪算哪 |
+| 06 | 大任务拆小，每个小任务干净的上下文 |
+| 07 | 用到时再加载，别全塞进 prompt |
+| 08 | 上下文总会满，要有办法腾地方 |
+| 09 | 压缩会丢细节，要有一层不丢的 |
+| 10 | prompt 是组装出来的，不是写死的 |
+| 11 | 错误不是终点，是重试的起点 |
+| 12 | 大目标拆成小任务，排好序，落盘 |
+| 13 | 慢操作丢后台，agent 继续思考 |
+| 14 | 定时触发，不需要人推 |
+| 15 | 一个搞不定，组队来 |
+| 16 | 队友之间要有约定 |
+| 17 | 队友自己看板，有活就认领 |
+| 18 | 各干各的目录，互不干扰 |
+| 19 | 能力不够，插上 MCP |
+| 20 | 机制很多，循环一个 |
 
 ---
 
-## s01 Agent Loop：整个系统的内核只有 20 行
+## 01 Agent Loop：整个系统的内核只有 20 行
 
 ### 问题
 
@@ -132,17 +134,17 @@ def agent_loop(messages: list):
 
 ### 取舍
 
-- **`stop_reason` 在流式响应下不完全可靠**。生产版不直接看它，而是用 `needsFollowUp` 标志：只要检测到 `tool_use` 块就置 true。
-- **单工具的代价很实在**。只有 bash 时，模型读文件要拼 `cat file.py`，写文件要拼 heredoc，既费 token 又容易转义出错。这是 s02 要解决的。
-- **`shell=True` 等于把系统交出去**。s01 的 `run_bash` 里有一个简单黑名单（`rm -rf /`、`sudo` 等）和超时截断，但那不是安全机制，只是防手滑。真正的权限体系在 s03。
+- **`stop_reason` 在流式响应下不完全可靠**。Claude Code 不直接看它，而是用 `needsFollowUp` 标志：只要检测到 `tool_use` 块就置 true。
+- **单工具的代价很实在**。只有 bash 时，模型读文件要拼 `cat file.py`，写文件要拼 heredoc，既费 token 又容易转义出错。这是第 2 节要解决的。
+- **`shell=True` 等于把系统交出去**。最小实现里的 `run_bash` 有一个简单黑名单（`rm -rf /`、`sudo` 等）和超时截断，但那不是安全机制，只是防手滑。真正的权限体系在第 3 节。
 
 ---
 
-## s02 Tool Use：让"加工具"不再等于"改循环"
+## 02 Tool Use：让"加工具"不再等于"改循环"
 
 ### 问题
 
-s01 把 `run_bash` 硬编码在循环里。加第二个工具就要在循环里写 if/elif，加到第十个工具循环就没法看了。
+第 1 节把 `run_bash` 硬编码在循环里。加第二个工具就要在循环里写 if/elif，加到第十个工具循环就没法看了。
 
 ### 实现
 
@@ -169,7 +171,7 @@ TOOL_HANDLERS = {
 循环里的改动只有一行：
 
 ```python
-# s01: output = run_bash(block.input["command"])
+# 之前: output = run_bash(block.input["command"])
 handler = TOOL_HANDLERS.get(block.name)
 output = handler(**block.input) if handler else f"Unknown: {block.name}"
 ```
@@ -181,12 +183,12 @@ output = handler(**block.input) if handler else f"Unknown: {block.name}"
 ### 取舍
 
 - **`input_schema` 是可靠性的来源**。让模型产出结构化参数，比让它产出一行需要正则解析的字符串稳定得多。工具描述写清楚，模型的调用准确率会明显不同。
-- **多工具调用的执行顺序**：教学版按 `response.content` 的原始顺序逐个执行。生产版会按连续块分批，batch 内并发安全的工具并行跑，batch 间严格串行——因为 `read_file` 之间无所谓顺序，但 `write_file` 和后续的 `read_file` 顺序反了结果就错了。这需要一个 `isConcurrencySafe()` 判定加分区算法。
-- 生产版还有 Zod schema 校验、`validateInput`、流式工具执行等，教学版为了主干清晰全部省略。
+- **多工具调用的执行顺序**：最小实现按 `response.content` 的原始顺序逐个执行。Claude Code 会按连续块分批，batch 内并发安全的工具并行跑，batch 间严格串行——因为 `read_file` 之间无所谓顺序，但 `write_file` 和后续的 `read_file` 顺序反了结果就错了。这需要一个并发安全判定加分区算法。
+- 生产实现还有 schema 校验、输入验证、流式工具执行等，为了主干清晰这里全部省略。
 
 ---
 
-## s03 Permission：三道闸门，默认拒绝
+## 03 Permission：三道闸门，默认拒绝
 
 ### 问题
 
@@ -238,15 +240,15 @@ if not check_permission(block):
 
 - **Gate 3 默认拒绝**。`ask_user` 只有输入 `y`/`yes` 才放行，回车即拒绝。审批交互一定要设计成 fail-closed。
 - **字符串黑名单不是安全机制**。命令变体、shell 展开、base64 解码、`$IFS` 拼接都能绕过。它挡的是"模型手滑"，不是"有人故意攻击"。真要防后者得上 AST 解析 + 沙箱。
-- 生产版的复杂度在另一个量级：4 种 `PermissionResult`（allow/deny/ask/passthrough）、8 个规则来源（用户设置、项目设置、本地设置、feature flag、企业策略、CLI 参数、内联命令、会话授权）、自动审批分类器，以及子 Agent 的权限请求向父 Agent 冒泡。
+- Claude Code 的实际复杂度在另一个量级：4 种权限决策结果（allow/deny/ask/passthrough）、8 个规则来源（用户设置、项目设置、本地设置、feature flag、企业策略、CLI 参数、内联命令、会话授权）、自动审批分类器，以及子 Agent 的权限请求向父 Agent 冒泡。
 
 ---
 
-## s04 Hooks：把扩展点从循环里搬出去
+## 04 Hooks：把扩展点从循环里搬出去
 
 ### 问题
 
-s03 为了加权限，改了循环。接下来要加日志、加审计、加"改完文件自动 git add"，每次都得再改一遍循环。这是典型的扩展点缺失。
+第 3 节为了加权限，改了循环。接下来要加日志、加审计、加"改完文件自动 git add"，每次都得再改一遍循环。这是典型的扩展点缺失。
 
 ### 实现
 
@@ -277,7 +279,7 @@ def trigger_hooks(event: str, *args):
 | `PostToolUse` | 工具执行后 | 副作用（自动 git add）、大输出告警 |
 | `Stop` | 循环即将退出 | 收尾统计、**强制续跑** |
 
-s03 的权限逻辑原封不动搬进一个回调，权限从此只是众多 `PreToolUse` hook 中的一个：
+第 3 节的权限逻辑原封不动搬进一个回调，权限从此只是众多 `PreToolUse` hook 中的一个：
 
 ```python
 register_hook("UserPromptSubmit", context_inject_hook)
@@ -302,11 +304,11 @@ if response.stop_reason != "tool_use":
 
 ### 取舍
 
-- 生产版有 27 个 hook 事件、14 字段的 `HookResult` 对象，还有 `stopHookActive` 标志防止 Stop hook 无限续跑（否则 hook 和模型可以互相顶牛顶到 token 耗尽）。教学版只保留 4 个事件。
+Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一个 `stopHookActive` 标志防止 Stop hook 无限续跑（否则 hook 和模型可以互相顶牛顶到 token 耗尽）。最小实现只保留 4 个事件。
 
 ---
 
-## s05 TodoWrite：给 Agent 一块外挂工作记忆
+## 05 TodoWrite：给 Agent 一块外挂工作记忆
 
 ### 问题
 
@@ -351,12 +353,12 @@ def agent_loop(messages: list):
 ### 取舍
 
 - **软引导 + 硬提醒的两层结构**：system prompt 说"请先规划"是软引导，模型可能不听；nag 是硬提醒，每 3 轮必到。两者互补，缺一个效果都会掉。
-- **提醒不是报错**。它不拒绝执行、不打断循环，只是在上下文里放一条信息让模型自己看到。这类"非破坏性纠偏"在 Agent 工程里很常用——同样的手法后面还会用于后台任务通知（s13）、cron 注入（s14）、收件箱注入（s15）。
-- 教学版的 TODO 存在进程内存里，退出即丢。生产版是内存版 TodoWrite 和落盘版 Task System 并存，各管一层（见 s12）。
+- **提醒不是报错**。它不拒绝执行、不打断循环，只是在上下文里放一条信息让模型自己看到。这类"非破坏性纠偏"在 Agent 工程里很常用——同样的手法后面还会用于后台任务通知（第 13 节）、定时任务注入（第 14 节）、收件箱注入（第 15 节）。
+- 最小实现的 TODO 存在进程内存里，退出即丢。Claude Code 是内存版 TodoWrite 和落盘版 Task System 并存，各管一层（见第 12 节）。
 
 ---
 
-## s06 Subagent：上下文隔离，但权限不隔离
+## 06 Subagent：上下文隔离，但权限不隔离
 
 ### 问题
 
@@ -410,7 +412,7 @@ def spawn_subagent(description: str) -> str:
 
 ---
 
-## s07 Skill Loading：目录常驻，内容按需
+## 07 Skill Loading：目录常驻，内容按需
 
 ### 问题
 
@@ -455,12 +457,12 @@ def load_skill(name: str) -> str:
 ### 取舍
 
 - **`load_skill` 只接受名字，不接受路径**。`SKILL_REGISTRY` 是启动时构建的查表，`name="../../etc/passwd"` 只会得到 `Skill not found`——因为 name 从来就不是文件路径。这个设计比"收路径再校验"更干净。
-- 拉进来的 skill 内容通过 `tool_result` 进入 `messages`，之后会随历史一直带着，直到被 s08 的压缩管线处理掉。所以 skill 文件本身不该无限长。
-- 教学版只解析 `name` / `description`。真实 Claude Code 的 frontmatter 还支持 `when_to_use`、`allowed-tools`、`context`、`model` 等字段。
+- 拉进来的 skill 内容通过 `tool_result` 进入 `messages`，之后会随历史一直带着，直到被第 8 节的压缩管线处理掉。所以 skill 文件本身不该无限长。
+- 最小实现只解析 `name` / `description`。Claude Code 的 frontmatter 还支持 `when_to_use`、`allowed-tools`、`context`、`model` 等字段。
 
 ---
 
-## s08 Context Compact：四层压缩，便宜的先跑
+## 08 Context Compact：四层压缩，便宜的先跑
 
 ### 问题
 
@@ -535,24 +537,24 @@ except Exception as e:
 
 ### 取舍
 
-这一章的细节几乎每一条都有理由，值得逐条看：
+这一层的细节几乎每一条都有理由，值得逐条看：
 
-- **为什么 L3 必须在 L2 之前**：L2 会把旧的大 `tool_result` 换成一行占位符。如果 L2 先跑，L3 就没东西可落盘了，那份输出直接永久丢失。生产版的 `applyToolResultBudget` 同样跑在最前面。
+- **为什么 L3 必须在 L2 之前**：L2 会把旧的大 `tool_result` 换成一行占位符。如果 L2 先跑，L3 就没东西可落盘了，那份输出直接永久丢失。Claude Code 的 `applyToolResultBudget` 同样跑在最前面。
 - **L1 为什么要留一条 `[snipped N messages]` 占位**：让模型知道"这里缺了一段"。否则它会基于一个看起来连续、实际上有断层的历史做推断，得出错误结论。**明确告知缺失，比悄悄删掉安全。**
 - **L2 为什么保留最近 3 条**：刚读进来的文件内容大概率马上要用，丢了模型就得重新读一遍，反而更贵。更旧的结果换成占位符，附带一句 "Re-run if needed"，模型需要时会自己重新调工具。
 - **L4 和 `reactive_compact` 的区别**：L4 只留摘要；`reactive_compact` 留摘要 + 最近 5 条消息。那 5 条是触发超限那一轮的现场，保留它模型才知道"刚才干了什么导致爆的"。
 - **L4 前一定先落盘 transcript**。压缩是有损且不可逆的，原始对话必须留一份，出问题能回溯。
 - **`compact` 工具的特殊性**：它是唯一一个"返回值不是文本"的工具——其他工具的输出追加到消息列表末尾，`compact` 是把整个列表换掉。所以在循环里它被单独截获，不走普通 handler 路径。
 
-教学版的简化：token 用字符数估算（生产版用精确 tokenizer）；`micro_compact` 用文本占位（生产版在 API 层做 `cache_edits`）；压缩后不自动重新附加关键文件。
+最小实现的简化点：token 用字符数估算（Claude Code 用精确 tokenizer）；`micro_compact` 用文本占位（生产实现在 API 层做缓存编辑）；压缩后不自动重新附加关键文件。
 
 ---
 
-## s09 Memory：压缩会丢细节，得有一层不丢的
+## 09 Memory：压缩会丢细节，得有一层不丢的
 
 ### 问题
 
-s08 把 5000 条消息压成一段摘要，细节必然丢失。而且它只管**单次会话内**的连续性——关掉终端重开，Agent 又是一张白纸。"我们项目用 4 空格缩进"这种事，不该每次都重新说一遍。
+第 8 节把 5000 条消息压成一段摘要，细节必然丢失。而且它只管**单次会话内**的连续性——关掉终端重开，Agent 又是一张白纸。"这个项目用 4 空格缩进"这种事，不该每次都重新说一遍。
 
 ### 实现
 
@@ -577,7 +579,7 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str):
 | `user` | 用户是谁、偏好什么 | 缩进用 4 空格 |
 | `feedback` | 该怎么做事 | 提交前必须跑 lint |
 | `project` | 项目事实 | 认证走 middleware/auth.ts |
-| `reference` | 东西在哪找 | API 规范在 confluence 某页 |
+| `reference` | 东西在哪找 | API 规范在某个文档页 |
 
 **加载**：两条路径。索引常驻 system prompt（每轮都带，但只有一行描述，token 便宜且能被 prompt cache 命中）；全文按需注入——由 LLM 自己从目录里挑：
 
@@ -611,17 +613,17 @@ if response.stop_reason != "tool_use":
 
 ### 取舍
 
-- **为什么用 LLM 选记忆而不是 embedding**：Sonnet 能理解语义关联（"改登录逻辑"和"认证走 middleware/auth.ts"的关系），不需要维护向量库、不需要处理索引更新。代价是一次额外的小额 API 调用。CC 源码同样用模型自己做这个选择。
-- **compaction 和 memory 的分工要清楚**：压缩管单会话内的连续性，记忆管跨会话的知识积累。两者不互相替代。
-- 整理（"Dream"）的触发在教学版简化成了文件数阈值。生产版有时间、扫描、会话、锁四层门控——毕竟整理会重写全部记忆文件，误触发的代价不小。
+- **为什么用 LLM 选记忆而不是 embedding**：模型能理解语义关联（"改登录逻辑"和"认证走 middleware/auth.ts"的关系），不需要维护向量库、不需要处理索引更新。代价是一次额外的小额 API 调用。Claude Code 同样用模型自己做这个选择。
+- **压缩和记忆的分工要清楚**：压缩管单会话内的连续性，记忆管跨会话的知识积累。两者不互相替代。
+- 整理（"Dream"）的触发在最小实现里简化成了文件数阈值。Claude Code 有时间、扫描、会话、锁四层门控——毕竟整理会重写全部记忆文件，误触发的代价不小。
 
 ---
 
-## s10 System Prompt：运行时组装，不硬编码
+## 10 System Prompt：运行时组装，不硬编码
 
 ### 问题
 
-前 9 章的 `SYSTEM` 是一整段硬编码字符串。三个问题：换项目要重写整段；改一处可能影响全局；不管当前用不用得上，每次请求都带全部内容。
+前 9 层的 `SYSTEM` 是一整段硬编码字符串。三个问题：换项目要重写整段；改一处可能影响全局；不管当前用不用得上，每次请求都带全部内容。
 
 ### 实现
 
@@ -671,15 +673,15 @@ def get_system_prompt(context: dict) -> str:
 - **`if memories:` 判断的是文件系统状态，不是对话内容**。哪些工具注册了、`.memory/MEMORY.md` 里有没有东西——这些是运行态事实。如果改成"在消息里搜 memory 这个词"，就会出现"用户提了一句记忆，但目录是空的，结果加载了一个空 section"这种情况。**按事实加载，不按关键词猜。**
 - **为什么用 `json.dumps(sort_keys=True)` 而不是 `hash()`**：`hash()` 有进程级随机化（`PYTHONHASHSEED`），跨进程不可靠；遇到 list/dict 直接 `unhashable type`。`json.dumps` 排序后是确定性字符串，同数据必然同 key。
 - **`assemble` 和 `get` 分开**：前者是纯函数只管拼接，后者有状态但对外透明。测试的时候只测 `assemble` 就够了。
-- 这里的缓存只是"避免重复拼字符串"，和 API 级的 prompt cache 是两件事。生产版用一个动态边界把 prompt 切成不同 cache scope 的块，静态部分命中全局缓存——这也解释了为什么 prompt 的 section 顺序要稳定：顺序一变，缓存全失效。（顺带说，这个约束在 s19 引入动态工具池之后被打破了，那一章会讲。）
+- 这里的缓存只是"避免重复拼字符串"，和 API 级的 prompt cache 是两件事。Claude Code 用一个动态边界把 prompt 切成不同 cache scope 的块，静态部分命中全局缓存——这也解释了为什么 prompt 的 section 顺序要稳定：顺序一变，缓存全失效。（顺带说，这个约束在第 19 节引入动态工具池之后被打破了，那一节会讲。）
 
 ---
 
-## s11 Error Recovery：三类错误，三条恢复路径
+## 11 Error Recovery：三类错误，三条恢复路径
 
 ### 问题
 
-生产环境里 API 调用不可能永远成功。429 限流、529 过载、网络抖动、输出被 `max_tokens` 截断——教学代码遇到这些直接抛异常退出，真实系统必须能自己爬起来。
+生产环境里 API 调用不可能永远成功。429 限流、529 过载、网络抖动、输出被 `max_tokens` 截断——最小实现遇到这些直接抛异常退出，真实系统必须能自己爬起来。
 
 ### 实现
 
@@ -711,7 +713,7 @@ if response.stop_reason == "max_tokens":
     return
 ```
 
-**路径二：上下文超限**。捕获 `prompt_too_long`，`reactive_compact` 后重试一次（复用 s08 的实现）。
+**路径二：上下文超限**。捕获 `prompt_too_long`，`reactive_compact` 后重试一次（复用第 8 节的实现）。
 
 **路径三：瞬时故障**。指数退避 + 抖动，连续 3 次 529 切备用模型：
 
@@ -749,11 +751,11 @@ def with_retry(fn, state: RecoveryState):
 
 ---
 
-## s12 Task System：落盘的任务图
+## 12 Task System：落盘的任务图
 
 ### 问题
 
-s05 的 TodoWrite 是进程内的清单，进程退出就没了，而且它表达不了"任务 B 必须等 A 完成"。多个 Agent 协作时更不够用——谁在做哪个任务，没地方记。
+第 5 节的 TodoWrite 是进程内的清单，进程退出就没了，而且它表达不了"任务 B 必须等 A 完成"。多个 Agent 协作时更不够用——谁在做哪个任务，没地方记。
 
 ### 实现
 
@@ -815,12 +817,12 @@ def complete_task(task_id: str) -> str:
 - **`blockedBy` 是硬约束不是建议**。依赖没完成，`claim_task` 直接拒绝。DAG 的语义就是只能从入度为 0 的节点开始。
 - **依赖文件缺失也算阻塞**，这是保守选择。任务文件被误删时，宁可卡住等人处理，也不要当成"依赖已满足"往下跑。
 - **完成任务不自动启动下游**，只在返回值里告诉 Agent"这几个现在可以做了"。状态转换保持显式，Agent 拿到信息自己决定做哪个——避免隐式连锁反应带来的不可预测性。
-- **TodoWrite 和 Task System 是两层，不是二选一**：前者是 Agent 当前这一轮的执行清单（内存、轻量、高频更新），后者是项目级的目标管理（磁盘、有依赖、跨会话跨 Agent）。生产版两者并存。
-- 教学版没有环检测，也没有 ID 复用保护（生产版有 highwatermark 文件）。
+- **TodoWrite 和 Task System 是两层，不是二选一**：前者是 Agent 当前这一轮的执行清单（内存、轻量、高频更新），后者是项目级的目标管理（磁盘、有依赖、跨会话跨 Agent）。Claude Code 两者并存。
+- 最小实现没有环检测，也没有 ID 复用保护（Claude Code 有 highwatermark 文件）。
 
 ---
 
-## s13 Background Tasks：慢操作丢后台
+## 13 Background Tasks：慢操作丢后台
 
 ### 问题
 
@@ -893,15 +895,15 @@ def collect_background_results() -> list[str]:
 - **两条判断路径的优先级**：模型显式传 `run_in_background` 优先，启发式兜底。给模型控制权，同时防它忘记传参。
 - **`pop` 而非 `get`**：取走立即删除，否则下一轮会重复注入同一条通知，模型会以为装了两次。
 - **`daemon=True`**：主进程退出线程跟着走，不需要写清理逻辑。
-- 生产版还有一个"停滞看门狗"：定期检查后台任务输出有没有增长，45 秒没动静就检测是不是卡在 `(y/n)` 这类交互式提示上——后台任务卡在无人应答的确认框里是很常见的故障。
+- Claude Code 还有一个"停滞看门狗"：定期检查后台任务输出有没有增长，45 秒没动静就检测是不是卡在 `(y/n)` 这类交互式提示上——后台任务卡在无人应答的确认框里是很常见的故障。
 
 ---
 
-## s14 Cron Scheduler：定时触发，四层解耦
+## 14 Cron Scheduler：定时触发，四层解耦
 
 ### 问题
 
-"每天 9 点跑一次回归测试"、"5 分钟后提醒我看 CI"。这类需求需要一个不依赖人推的触发源。
+"每天 9 点跑一次回归测试"、"5 分钟后提醒看 CI"。这类需求需要一个不依赖人推的触发源。
 
 ### 实现
 
@@ -988,11 +990,11 @@ def queue_processor_loop():
 
 ---
 
-## s15 Agent Teams：持久队友 + 文件邮箱
+## 15 Agent Teams：持久队友 + 文件邮箱
 
 ### 问题
 
-大项目重构要同时改 5 个模块。s06 的子 Agent 是一次性的、同步的、用完即销毁，没法"派出去以后还能继续对话"。
+大项目重构要同时改 5 个模块。第 6 节的子 Agent 是一次性的、同步的、用完即销毁，没法"派出去以后还能继续对话"。
 
 ### 实现
 
@@ -1028,7 +1030,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     def run():
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [bash, read_file, write_file, send_message]   # 只有 4 个
-        for _ in range(10):                                       # 教学版 10 轮上限
+        for _ in range(10):                                       # 10 轮上限
             inbox = BUS.read_inbox(name)
             if inbox:
                 messages.append({"role": "user",
@@ -1057,16 +1059,16 @@ if inbox:
 
 ### 取舍
 
-- **文件即邮箱**。不需要注册中心、连接管理、心跳保活。`send` 是追加写，`read_inbox` 是读完删除。教学场景下这个方案的复杂度/能力比极高。
+- **文件即邮箱**。不需要注册中心、连接管理、心跳保活。`send` 是追加写，`read_inbox` 是读完删除。这个方案的复杂度/能力比很高。
 - **队友的工具集是受限的**：只有 bash / read / write / send_message。**不能 `spawn_teammate`**（防无限递归开线程）、不能调度 cron、不能认领任务。能力边界即安全边界。
 - **`messages[-20:]` 切片**：队友的上下文不做完整压缩管线，直接截断。够用，且省事。
 - **摘要不调 LLM**：从自己的历史里取最后一条 assistant 文本作为结果，省一次 API 调用。
 - **推 + 拉互补**：Lead 既在每轮结束自动收信（推），也有 `check_inbox` 工具主动查（拉）。
-- **已知竞态**：`read_inbox` 的 read + unlink 不是原子操作，多线程同时读同一个收件箱可能丢消息。生产版用文件锁（proper-lockfile）保证并发安全。这是教学版明确标注的简化点。
+- **已知竞态**：`read_inbox` 的 read + unlink 不是原子操作，多线程同时读同一个收件箱可能丢消息。Claude Code 用文件锁保证并发安全，这是最小实现明确标注的简化点。
 
 ---
 
-## s16 Team Protocols：异步通信需要请求-响应约定
+## 16 Team Protocols：异步通信需要请求-响应约定
 
 ### 问题
 
@@ -1158,7 +1160,7 @@ if response.stop_reason != "tool_use":
 
 ---
 
-## s17 Autonomous Agents：自己看板认领，不用逐个分配
+## 17 Autonomous Agents：自己看板认领，不用逐个分配
 
 ### 问题
 
@@ -1221,11 +1223,11 @@ def idle_poll(agent_name, messages, name, role) -> str:
 - **收件箱必须先于任务板检查**。反过来的话，任务板一直有活，关机请求就永远排不上——被饿死。控制信令优先于工作信令，这是通用原则。
 - **`claim_task` 的 owner 检查是乐观锁**。两个队友同时扫到同一个任务，先写成功的那个把 `owner` 和 `status` 落盘，第二个再 `claim` 时因为 `status != pending` 被拒。没有文件锁，但能挡住绝大多数竞态。真正的强一致需要文件锁或 CAS。
 - **身份重注入**：上下文压缩之后，队友可能"忘了自己是谁"（name 和 role 在早期消息里，被压掉了）。所以每次恢复工作时重新注入身份信息。这个坑在长时间运行的 Agent 上一定会遇到。
-- **超时退出而不是永久驻留**：60 秒没活就发个 summary 退出，避免一堆空转线程。生产版是等到显式 `shutdown_request` 才退。
+- **超时退出而不是永久驻留**：60 秒没活就发个 summary 退出，避免一堆空转线程。Claude Code 是等到显式关机请求才退。
 
 ---
 
-## s18 Worktree Isolation：任务管目标，worktree 管目录
+## 18 Worktree Isolation：任务管目标，worktree 管目录
 
 ### 问题
 
@@ -1291,7 +1293,7 @@ def remove_worktree(name: str, discard_changes: bool = False) -> str:
     ...
 ```
 
-队友侧用一个 dict 做闭包内的可变引用，跟踪"我现在在哪个目录干活"：
+队友侧用一个 dict 做闭包内的可变引用，跟踪"当前在哪个目录干活"：
 
 ```python
 wt_ctx = {"path": None}     # 用 dict 而不是 nonlocal，闭包内可改
@@ -1302,18 +1304,18 @@ wt_ctx = {"path": None}     # 用 dict 而不是 nonlocal，闭包内可改
 ### 取舍
 
 - **白名单正则比黑名单可靠**。`^[A-Za-z0-9._-]{1,64}$` 直接封死 `../`、绝对路径、shell 元字符。黑名单永远列不全。
-- **绑定不改任务状态**。`bind_task_to_worktree` 只写 `worktree` 字段，`status` 保持 `pending`——否则任务就不在"可认领"集合里了，s17 的自动认领会失效。**两个机制正交组合时要特别小心状态字段的相互影响。**
+- **绑定不改任务状态**。`bind_task_to_worktree` 只写 `worktree` 字段，`status` 保持 `pending`——否则任务就不在"可认领"集合里了，第 17 节的自动认领会失效。**两个机制正交组合时要特别小心状态字段的相互影响。**
 - **删除前查两样东西**：`git status --porcelain` 查未提交文件，`git log @{push}..HEAD` 查未推送提交。查询本身失败时（返回 -1）也拒绝删除——**验证不了就不要动手**。
 - **`events.jsonl` 是 append-only 审计日志**。create / remove / keep 全部留痕。多 Agent 并行改代码的场景，"谁在什么时候动了哪个目录"必须可追溯。
 - `keep_worktree` 提供第三条路：不删，留着人工 review。Agent 干完的活不一定敢直接合。
 
 ---
 
-## s19 MCP Plugin：把外部工具接进同一个工具池
+## 19 MCP Plugin：把外部工具接进同一个工具池
 
 ### 问题
 
-内置工具是编译期固定的。要接公司的内部文档系统、监控平台、工单系统，不能每接一个就改一次 Agent 代码。
+内置工具是编译期固定的。要接内部文档系统、监控平台、工单系统，不能每接一个就改一次 Agent 代码。
 
 ### 实现
 
@@ -1374,20 +1376,20 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
 3. **闭包默认参数绑定**：`lambda *, c=mcp_client, t=tool_def["name"], **kw` —— 如果写成 `lambda **kw: mcp_client.call_tool(tool_def["name"], kw)`，Python 的闭包晚绑定会让所有 lambda 都指向循环最后一次迭代的变量，**所有 MCP 工具都会调用同一个工具**。这是 Python 里最经典的陷阱之一，在动态注册场景必然遇到。
 4. **不做缓存**：工具池会变，缓存就是错误的来源。
 
-代价也很明确：**s10 的 system prompt 缓存在这一章被移除了**。工具列表进 prompt，工具池动态变化后缓存必然失效，硬留着只会产生"模型看到的工具列表和实际能调的不一致"这种极难排查的 bug。**正确性优先于优化。**
+代价也很明确：**第 10 节的 system prompt 缓存在这一层被移除了**。工具列表进 prompt，工具池动态变化后缓存必然失效，硬留着只会产生"模型看到的工具列表和实际能调的不一致"这种极难排查的 bug。**正确性优先于优化。**
 
 `connect_mcp` 被调用后，`agent_loop` 重新跑一次 `assemble_tool_pool()`，下一轮 LLM 调用就能看到新工具。
 
 ---
 
-## s20 Comprehensive：机制很多，循环一个
+## 20 综合架构：机制很多，循环一个
 
-s20 不发明新机制，它把前 19 章合成一个 2282 行的完整 harness。最有价值的部分是**每个机制挂在循环的哪个位置**。
+最后一层不发明新机制，而是把前 19 层合成一个完整 harness。最有价值的部分是**每个机制挂在循环的哪个位置**。
 
 ### 全景
 
 - **27 个内置工具**：基础 5（bash / read_file / write_file / edit_file / glob）+ 计划 2（todo_write / task）+ 技能 1（load_skill）+ 压缩 1（compact）+ 任务图 5（create/list/get/claim/complete_task）+ 定时 3（schedule/list/cancel_cron）+ 团队 6（spawn_teammate / send_message / check_inbox / request_shutdown / request_plan / review_plan）+ worktree 3（create/remove/keep）+ MCP 1（connect_mcp），再加上运行时接入的 N 个 MCP 工具
-- **4 个守护线程**：cron 调度、cron 自动执行、后台任务 worker、队友线程
+- **4 个守护线程**：定时调度、定时任务自动执行、后台任务 worker、队友线程
 - **3 把锁**：`agent_lock`（主循环互斥）、`cron_lock`、`background_lock`
 - **4 个 hook 事件**：`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`
 
@@ -1401,7 +1403,7 @@ def agent_loop(messages: list, context: dict):
     max_tokens = DEFAULT_MAX_TOKENS
 
     while True:
-        # ① 注入 cron 队列 + 后台任务完成通知
+        # ① 注入定时任务队列 + 后台任务完成通知
         for job in consume_cron_queue():
             messages.append({"role": "user", "content": f"[Scheduled] {job.prompt}"})
         inject_background_notifications(messages)
@@ -1482,28 +1484,28 @@ def agent_loop(messages: list, context: dict):
         messages.append({"role": "user", "content": build_user_content(results)})
 ```
 
-对比 s01 那 20 行，结构完全一样：**发消息 → 判断 → 执行 → 回传**。多出来的全是挂在特定位置的机制。
+对比第 1 节那 20 行，结构完全一样：**发消息 → 判断 → 执行 → 回传**。多出来的全是挂在特定位置的机制。
 
 ### 分层视图
 
 | 层 | 组成 | 来自 |
 |---|---|---|
-| 主循环 | `agent_loop` 的 7 步 | s01 |
-| 工具分发 | `assemble_tool_pool` + BUILTIN_TOOLS/HANDLERS + MCP 池 | s02, s19 |
-| 权限与钩子 | `HOOKS` 字典 + `permission_hook` / `log_hook` | s03, s04 |
-| 上下文管理 | 4 层压缩 + prompt 组装 + memory | s08, s09, s10 |
-| 错误恢复 | `RecoveryState` + `with_retry` + 升级 + 应急压缩 | s11 |
-| 并发管理 | 3 把锁 + 4 个守护线程 | s13, s14, s15 |
-| 任务管理 | TodoWrite（内存）+ Task 图（磁盘）+ subagent / teammate | s05, s06, s12 |
-| 定时调度 | `CronJob` + 调度线程 + 自动执行线程 | s14 |
-| 团队通信 | `MessageBus` + `ProtocolState` + 队友线程 + idle poll | s15, s16, s17 |
-| 空间隔离 | worktree + `wt_ctx` + `events.jsonl` | s18 |
+| 主循环 | `agent_loop` 的 7 步 | 01 |
+| 工具分发 | `assemble_tool_pool` + BUILTIN_TOOLS/HANDLERS + MCP 池 | 02, 19 |
+| 权限与钩子 | `HOOKS` 字典 + `permission_hook` / `log_hook` | 03, 04 |
+| 上下文管理 | 4 层压缩 + prompt 组装 + memory | 08, 09, 10 |
+| 错误恢复 | `RecoveryState` + `with_retry` + 升级 + 应急压缩 | 11 |
+| 并发管理 | 3 把锁 + 4 个守护线程 | 13, 14, 15 |
+| 任务管理 | TodoWrite（内存）+ Task 图（磁盘）+ subagent / teammate | 05, 06, 12 |
+| 定时调度 | `CronJob` + 调度线程 + 自动执行线程 | 14 |
+| 团队通信 | `MessageBus` + `ProtocolState` + 队友线程 + idle poll | 15, 16, 17 |
+| 空间隔离 | worktree + `wt_ctx` + `events.jsonl` | 18 |
 
-### 组合时新增的几个设计
+### 组合时的几个关键设计
 
 - **权限从工具里彻底移出**，只作为 `PreToolUse` hook 存在。三道防线：bash 黑名单 → write_file 路径校验 → MCP 破坏性工具确认。
 - **`compact` 在权限之前就被截获**，它不是普通工具，不该走 handler 路径。
-- **`cron_autorun_loop` 和 `agent_loop` 通过 `agent_lock` 互斥**，否则两边同时改 `session_history` 会直接把消息列表搞坏。
+- **定时任务自动执行线程和 `agent_loop` 通过 `agent_lock` 互斥**，否则两边同时改会话历史会直接把消息列表搞坏。
 - **两层计划并存**：`todo_write`（当前执行清单，内存）+ 任务图（项目目标，磁盘）。
 - **两种委派并存**：`spawn_subagent`（一次性、同步、干净上下文）+ `spawn_teammate`（持久、异步、可通信）。选哪个取决于任务是"要一个答案"还是"要一个长期干活的人"。
 
@@ -1511,16 +1513,16 @@ def agent_loop(messages: list, context: dict):
 
 ## 横向总结：反复出现的 7 个工程模式
 
-拆完 20 章，会发现真正被复用的模式并不多：
+拆完这 20 层，会发现真正被复用的模式并不多：
 
 **1. 主循环不变，能力挂在扩展点上**
-`TOOL_HANDLERS`（加工具）、`HOOKS`（加行为）、`PROMPT_SECTIONS`（加上下文）、`assemble_tool_pool`（加外部能力）。20 章下来 `agent_loop` 的骨架没变过。这不是巧合，而是一开始就把变化点识别出来了。
+`TOOL_HANDLERS`（加工具）、`HOOKS`（加行为）、`PROMPT_SECTIONS`（加上下文）、`assemble_tool_pool`（加外部能力）。20 层下来 `agent_loop` 的骨架没变过。这不是巧合，而是一开始就把变化点识别出来了。
 
 **2. 索引常驻，内容按需**
-skill 目录 vs skill 全文（s07）、MEMORY.md 索引 vs 记忆全文（s09）。都是"让模型知道有什么可用，然后自己拉"，而不是前置塞满。
+skill 目录 vs skill 全文（07）、MEMORY.md 索引 vs 记忆全文（09）。都是"让模型知道有什么可用，然后自己拉"，而不是前置塞满。
 
 **3. 便宜的先跑，贵的后跑**
-压缩四层（s08）：三层纯文本操作 0 次 API 调用，实在不行才调 LLM 摘要。错误恢复（s11）：先重试，再升级 token，最后才压缩。**先用不花钱的手段。**
+压缩四层（08）：三层纯文本操作 0 次 API 调用，实在不行才调 LLM 摘要。错误恢复（11）：先重试，再升级 token，最后才压缩。**先用不花钱的手段。**
 
 **4. 拒绝要能被看见，不要抛异常**
 权限拒绝、工具不存在、MCP 报错，全部作为 `tool_result` 内容回传。模型看到失败原因会自己换路子；抛异常则整个循环死掉。
@@ -1532,18 +1534,18 @@ skill 目录 vs skill 全文（s07）、MEMORY.md 索引 vs 记忆全文（s09�
 子 Agent 没有 `task` 工具所以不能递归；队友没有 `spawn_teammate` 所以不能开线程炸弹；`load_skill` 只接受名字所以不可能路径穿越。**"从工具集里去掉"比"加判断拦住"更可靠。**
 
 **7. 非破坏性纠偏**
-todo nag、后台通知、cron 注入、收件箱注入、Stop hook 续跑——统一手法都是"往消息流里塞一条信息"，从不强制中断。控制流不打断，信息给到位，让模型自己决定。
+todo nag、后台通知、定时任务注入、收件箱注入、Stop hook 续跑——统一手法都是"往消息流里塞一条信息"，从不强制中断。控制流不打断，信息给到位，让模型自己决定。
 
 ---
 
-## 教学版与生产版的差距清单
+## 最小实现与生产实现的差距清单
 
-这个项目是 0→1 的学习实现，有意省略了不少生产机制。落地时要补的主要是这些：
+本文的代码是为讲清原理写的最小复现，有意省略了不少生产机制。真要落地，主要要补的是这些：
 
-| 机制 | 教学版 | 生产版需要补 |
+| 机制 | 最小实现 | 生产实现需要补 |
 |---|---|---|
 | 工具并发 | 顺序执行 | 并发安全判定 + 分区批处理 |
-| 参数校验 | 直接 `**kwargs` | schema 校验（Zod 等）+ 输入清洗 |
+| 参数校验 | 直接 `**kwargs` | schema 校验 + 输入清洗 |
 | 权限 | 黑名单 + 2 条规则 | 4 种决策结果 + 多来源规则合并 + 权限冒泡 |
 | Hooks | 4 个事件 | 27 个事件 + 防无限续跑标志 |
 | token 计量 | 字符数估算 | 精确 tokenizer |
@@ -1560,30 +1562,20 @@ todo nag、后台通知、cron 注入、收件箱注入、Stop hook 续跑——
 
 ## 落地建议
 
-如果要把这套东西用在我们自己的场景，按这个顺序推进风险最低：
+如果要把这套结构用在自己的业务场景里，按这个顺序推进风险最低：
 
-1. **先做 s01–s04**：循环、工具表、权限管线、hook 注册表。这四层是地基，后面所有机制都挂在上面。**尤其 hook 系统要早做**——一旦开始往循环里塞 if/elif，后面每加一个功能都在还技术债。
-2. **然后是 s08 + s12**：上下文压缩和落盘任务图。这两个决定了 Agent 能不能处理"跑一小时以上"的任务。没有它们，Agent 只能做小任务。
-3. **s07 + s09 按需**：如果领域知识多（内部规范、API 文档、流程约定），先做 skill loading；如果重复交互多（同一批人反复用），先做 memory。
-4. **多 Agent（s15–s18）最后做**。它的复杂度和收益都集中在"大规模并行改代码"这一类场景。单 Agent 加 subagent（s06）能覆盖大部分日常需求，先把单 Agent 做扎实。
+1. **先做 01–04**：循环、工具表、权限管线、hook 注册表。这四层是地基，后面所有机制都挂在上面。**尤其 hook 系统要早做**——一旦开始往循环里塞 if/elif，后面每加一个功能都在还技术债。
+2. **然后是 08 + 12**：上下文压缩和落盘任务图。这两个决定了 Agent 能不能处理"跑一小时以上"的任务。没有它们，Agent 只能做小任务。
+3. **07 + 09 按需**：如果领域知识多（内部规范、API 文档、流程约定），先做 skill loading；如果重复交互多（同一批人反复用），先做 memory。
+4. **多 Agent（15–18）最后做**。它的复杂度和收益都集中在"大规模并行改代码"这一类场景。单 Agent 加 subagent（06）能覆盖大部分日常需求，先把单 Agent 做扎实。
 5. **工具设计上花的时间不会浪费**。工具描述、参数 schema、错误返回文案，直接决定模型的调用准确率。这部分投入的产出比调 prompt 高得多。
-
-一句话收尾：**我们的工作不是编写智能，而是构建智能栖居的环境。** 这个环境的质量——Agent 能看多清楚、行动多精准、可用知识有多丰富——直接决定了模型能力有多少能真正兑现出来。
 
 ---
 
-## 参考
+## 学习方法上的一点体会
 
-- 项目主线代码：`s01_agent_loop/` ~ `s20_comprehensive/`，每章含中文 README、个人笔记 `sXX.md`、可独立运行的 `code.py`
-- 运行方式：
+拆这套东西最有效的方式不是从头到尾读文档，而是**先写一个 20 行的最小循环跑通，再逐个往上加机制**。每加一层都会自然遇到一个具体问题（上下文爆了、工具加不动了、权限管不住了），这时候再去看真实实现怎么解决，理解会深得多。反过来先看完整架构图，很容易记住了组件名字却不知道每个组件在挡什么问题。
 
-```sh
-pip install -r requirements.txt
-cp .env.example .env            # 填入 ANTHROPIC_API_KEY
+另一个体会是：这套机制里绝大部分设计不是为了让 Agent "更聪明"，而是为了让它**在环境里不出错**——压缩要保留断层标记、拒绝要能被模型看见、删目录前要先查未提交变更、闭包要显式绑定默认参数。**harness 工程的本质更接近可靠性工程，而不是提示词工程。**
 
-python s01_agent_loop/code.py        # 起点：一个循环 + bash
-python s08_context_compact/code.py   # 压缩管线
-python s20_comprehensive/code.py     # 终点：全部机制归一个循环
-```
-
-建议的读法：先跑 s01，把那 20 行看透；然后直接跳 s20 看最终形态；再回头按顺序补中间 18 章。这样每一章"为什么需要它"会清楚得多。
+最后一句总结：这类工作不是在编写智能，而是在构建智能栖居的环境。这个环境的质量——Agent 能看多清楚、行动多精准、可用知识有多丰富——直接决定了模型能力有多少能真正兑现出来。
