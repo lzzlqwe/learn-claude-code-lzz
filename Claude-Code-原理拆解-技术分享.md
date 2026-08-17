@@ -249,7 +249,7 @@ if not check_permission(block):
 
 ### 问题
 
-第 3 节为了加权限，改了循环。接下来要加日志、加审计、加"改完文件自动 git add"，每次都得再改一遍循环。这是典型的扩展点缺失。
+第 3 节为了加权限，改了循环。接下来要加日志、加审计、加"改完文件自动 git add"，每次都得再改一遍循环。当前扩展性比较差。
 
 ### 实现
 
@@ -319,7 +319,7 @@ Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一�
 
 ### 问题
 
-复杂任务做到一半，Agent 忘了最初的目标。原因很物理：对话越长，system prompt 里那句"请先规划"在注意力里的权重就越低。
+复杂任务做到一半，Agent 忘了最初的目标。原因在于：工具结果不断填满上下文，系统提示和最初目标在注意力机制里的权重就越来越低。
 
 ### 实现
 
@@ -336,7 +336,7 @@ def run_todo_write(todos: list) -> str:
         if t["status"] not in ("pending", "in_progress", "completed"):
             return f"Error: todos[{i}] has invalid status '{t['status']}'"
     CURRENT_TODOS = todos
-    # ... 彩色打印当前任务列表 ...
+    # ... 打印当前任务列表 ...
     return f"Updated {len(CURRENT_TODOS)} tasks"
 ```
 
@@ -376,7 +376,7 @@ def agent_loop(messages: list):
 
 ### 问题
 
-"分析这 30 个文件里的重复逻辑"——如果在主对话里做，30 个文件的全文会永久留在 `messages` 里，把后面所有轮次的上下文都占掉。而主 Agent 真正需要的只是一句结论。
+"分析这 30 个文件里的重复逻辑"——如果在主对话里做，30 个文件的全文会留在 `messages` 里，这些中间过程占着上下文位置，让 Agent 越来越"健忘"，它都记不住最初的问题是什么了。但主 Agent 真正需要的其实只是一句结论。
 
 ### 实现
 
