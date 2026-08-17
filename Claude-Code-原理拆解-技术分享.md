@@ -61,6 +61,20 @@ Claude Code = 一个 agent loop
 | 五、能协作 | 15 Agent Teams / 16 Team Protocols / 17 Autonomous Agents / 18 Worktree Isolation | 队友+邮箱、请求-响应协议、自主认领、目录隔离 |
 | 六、能扩展并合体 | 19 MCP Plugin / 20 综合架构 | 外部工具接入、全机制归一个循环 |
 
+### 代码约定
+
+全文代码片段共用几个符号，后面不再重复解释：
+
+| 符号 | 含义 |
+|---|---|
+| `client` | Anthropic 官方 SDK 客户端，`client.messages.create(...)` 就是一次模型调用 |
+| `MODEL` / `SYSTEM` | 模型名、system prompt |
+| `WORKDIR` | Agent 的工作目录，也是文件访问的沙箱边界 |
+| `messages` | 对话历史，`{role, content}` 列表 |
+| `block` | 模型返回的单个内容块，`block.name` / `block.input` / `block.id` 分别是内容块名、参数、调用 ID |
+
+为控制篇幅，与当前主线无关的函数体会省略，但会用注释标注它的输入输出和职责，不会出现没交代的调用。
+
 ---
 
 ## 01 Agent Loop：ReAct 设计框架
@@ -91,7 +105,7 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
-                output = run_bash(block.input["command"])
+                output = run_bash(block.input["command"])  # 跑 shell 命令，带超时与输出截断
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -113,12 +127,12 @@ def agent_loop(messages: list):
 ### 要点与取舍
 
 - **`stop_reason` 在流式响应下不完全可靠**。Claude Code 不直接看它，而是用 `needsFollowUp` 标志：只要检测到 `tool_use` 块就置 true。
-- **单工具的代价很实在**。只有 bash 时，模型读文件要拼 `cat file.py`，写文件要拼 heredoc，既费 token 又容易转义出错。这是第 2 节要解决的。
-- **`shell=True` 等于把系统交出去**。最小实现里的 `run_bash` 有一个简单黑名单（`rm -rf /`、`sudo` 等）和超时截断，但那不是安全机制，只是防手滑。真正的权限体系在第 3 节。
+- **单工具带来不小代价**。只有 bash 时，模型读文件要拼 `cat file.py`，写文件要拼 heredoc（shell 里把多行文本当输入的写法，如 `cat > f <<EOF ... EOF`），既费 token 又容易转义出错。这是第 2 节要解决的。
+- **防止 Agent 执行危险操作**。最小实现里的 `run_bash` 有一个简单黑名单（`rm -rf /`、`sudo` 等）和超时截断，但那不是安全机制，只是防手滑。权限控制在第 3 节。
 
 ---
 
-## 02 Tool Use：让"加工具"不再等于"改循环"
+## 02 Tool Use："加工具"不用"改循环"
 
 ### 问题
 
@@ -134,12 +148,15 @@ TOOLS = [
      "input_schema": {"type": "object",
                       "properties": {"command": {"type": "string"}},
                       "required": ["command"]}},
+    # 下面四个工具的 schema 结构同上，只是参数不同，此处省略
     {"name": "read_file", ...},
     {"name": "write_file", ...},
     {"name": "edit_file", ...},
     {"name": "glob", ...},
 ]
 
+# 五个 handler 都是十几行的薄封装：run_read 读文件（可限行数）、run_write 写文件、
+# run_edit 精确替换一处文本、run_glob 按通配符列文件；路径统一经 safe_path 校验
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,
@@ -156,7 +173,7 @@ output = handler(**block.input) if handler else f"Unknown: {block.name}"
 
 从此加工具 = 加一条 schema + 加一行映射，`agent_loop` 永久不动。
 
-同时引入了第一道安全边界 `safe_path()`：所有文件类工具的路径都要经过它，确保解析后仍在工作目录内。没有它，模型（或者一段被注入的提示词）可以用 `../../../../etc/shadow` 走出去。
+同时引入了第一道安全边界 `safe_path(p)`：把传入路径拼到 `WORKDIR` 下、调 `resolve()` 展开 `..` 和符号链接，再确认结果仍在 `WORKDIR` 内，否则报错。所有文件类工具的路径都要过它。没有它，模型（或者一段被注入的提示词）可以用 `../../../../etc/shadow` 走出去。
 
 ### 要点与取舍
 
@@ -170,16 +187,18 @@ output = handler(**block.input) if handler else f"Unknown: {block.name}"
 
 ### 问题
 
-文件工具被 `safe_path` 管住了，但 bash 还是敞开的。而且"要不要执行这条命令"是**策略问题**，不该写在 `run_bash` 里面——那会让工具函数同时承担"能不能做"和"该不该做"两件事。
+文件工具被 `safe_path` 管住了，但 bash 仍然不受限制。而且"要不要执行这条命令"是**策略问题**，不该写在 `run_bash` 里面——那会让工具函数同时承担"能不能做"和"该不该做"两件事。
 
 ### 实现
 
 把权限从工具里抽出来，做成独立的三级管线：
 
 ```python
+# Gate 1 的硬黑名单：命令中含任一字串就无条件拒绝
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot",
              "mkfs", "dd if=", "> /dev/sda", "format "]
 
+# Gate 2 的规则表：tools 限定适用工具，check 返回 True 表示命中，message 是提示给用户的理由
 PERMISSION_RULES = [
     {"tools": ["write_file", "edit_file"],
      "check": lambda args: not (WORKDIR / args.get("path", "")).resolve()
@@ -191,6 +210,10 @@ PERMISSION_RULES = [
      "message": "Potentially destructive command"},
 ]
 
+# 三个辅助函数都是几行遍历，此处只给签名：
+#   check_deny_list(command)      -> 命中 DENY_LIST 返回拒绝原因字符串，否则 None
+#   check_rules(tool_name, args)  -> 命中 PERMISSION_RULES 返回该规则的 message，否则 None
+#   ask_user(tool_name, args, reason) -> 终端打印警告并读一行输入，返回 "allow" / "deny"
 def check_permission(block) -> bool:
     if block.name == "bash":                      # Gate 1: 硬黑名单，不问用户
         reason = check_deny_list(block.input.get("command", ""))
@@ -216,8 +239,8 @@ if not check_permission(block):
 
 ### 要点与取舍
 
-- **Gate 3 默认拒绝**。`ask_user` 只有输入 `y`/`yes` 才放行，回车即拒绝。审批交互一定要设计成 fail-closed。
-- **字符串黑名单不是安全机制**。命令变体、shell 展开、base64 解码、`$IFS` 拼接都能绕过。它挡的是"模型手滑"，不是"有人故意攻击"。真要防后者得上 AST 解析 + 沙箱。
+- **Gate 3 默认拒绝**。`ask_user` 只有输入 `y`/`yes` 才放行，回车即拒绝。审批交互一定要设计成 fail-closed（判断不了或无人应答时一律拒绝）。
+- **字符串黑名单不是安全机制**。命令变体、shell 展开、base64 解码、拿 `$IFS`（shell 的内部分隔符变量）拼接都能绕过。它挡的是"模型手滑"，不是"有人故意攻击"。真要防后者得上命令行语法树（AST）解析 + 沙箱。
 - Claude Code 的实际复杂度在另一个量级：4 种权限决策结果（allow/deny/ask/passthrough）、8 个规则来源（用户设置、项目设置、本地设置、feature flag、企业策略、CLI 参数、内联命令、会话授权）、自动审批分类器，以及子 Agent 的权限请求向父 Agent 冒泡。
 
 ---
@@ -260,6 +283,12 @@ def trigger_hooks(event: str, *args):
 第 3 节的权限逻辑原封不动搬进一个回调，权限从此只是众多 `PreToolUse` hook 中的一个：
 
 ```python
+# 五个回调的职责（实现略）：
+#   context_inject_hook(query)      向用户输入里补当前目录、分支等环境信息
+#   permission_hook(block)          就是第 3 节的 check_permission，被拒返回原因字符串
+#   log_hook(block)                 打印即将执行的工具名与参数，返回 None 不拦
+#   large_output_hook(block, out)   输出过大时告警，返回 None 不拦
+#   summary_hook(messages)          退出前统计本次会话的工具调用次数
 register_hook("UserPromptSubmit", context_inject_hook)
 register_hook("PreToolUse", permission_hook)
 register_hook("PreToolUse", log_hook)
@@ -297,6 +326,8 @@ Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一�
 一个**不干实事**的工具——它不读文件、不跑命令，只把计划写下来：
 
 ```python
+CURRENT_TODOS: list[dict] = []     # 进程内存，退出即丢
+
 def run_todo_write(todos: list) -> str:
     global CURRENT_TODOS
     for i, t in enumerate(todos):
@@ -309,10 +340,10 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 ```
 
-配一个 nag 机制：连续 3 轮没调用 `todo_write`，就往消息流里塞一条提醒。
+再配一个 nag 机制（周期性提醒）：连续 3 轮没调用 `todo_write`，就往消息流里塞一条提醒。
 
 ```python
-rounds_since_todo = 0
+rounds_since_todo = 0              # 计数器：连续多少轮没更新 todo
 
 def agent_loop(messages: list):
     global rounds_since_todo
@@ -321,11 +352,16 @@ def agent_loop(messages: list):
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
-        ...
+
+        # ... 调 LLM、判断 stop_reason（同第 1 节）...
         rounds_since_todo += 1
-        # 本轮调用了 todo_write 就重置
-        if block.name == "todo_write":
-            rounds_since_todo = 0
+
+        for block in response.content:             # 遍历本轮工具调用
+            if block.type != "tool_use":
+                continue
+            # ... 执行工具、收集 tool_result ...
+            if block.name == "todo_write":         # 本轮更新过 todo 就清零
+                rounds_since_todo = 0
 ```
 
 ### 要点与取舍
@@ -347,6 +383,10 @@ def agent_loop(messages: list):
 派生一个带**干净 `messages`** 的独立循环，跑完只把最后的文本结论带回来，中间过程全部丢弃：
 
 ```python
+# 子 Agent 专用的三个常量：
+#   SUB_SYSTEM   独立的 system prompt，要求"干完直接给结论，不要再往下委派"
+#   SUB_TOOLS    只有 5 个基础工具（bash / read / write / edit / glob），没有 task
+#   SUB_HANDLERS SUB_TOOLS 对应的 handler 表，结构同第 2 节的 TOOL_HANDLERS
 def spawn_subagent(description: str) -> str:
     messages = [{"role": "user", "content": description}]   # 干净上下文
 
@@ -373,8 +413,9 @@ def spawn_subagent(description: str) -> str:
                                 "tool_use_id": block.id, "content": output})
         messages.append({"role": "user", "content": results})
 
+    # extract_text(content): 从内容块列表里拼出纯文本，忽略 tool_use 块
     result = extract_text(messages[-1]["content"])   # 只要结论
-    ...
+    # ... 为空时向前回溯找最后一条有文本的 assistant 消息 ...
     return result
 ```
 
@@ -398,20 +439,25 @@ def spawn_subagent(description: str) -> str:
 
 ### 实现
 
-两级加载。第一级把**目录**（名称 + 一行描述）注入 system prompt，第二级由 Agent 自己调工具拉**全文**。
+两级加载。第一级把**目录**（名称 + 一行描述）注入 system prompt，第二级由 Agent 自己调工具拉**全文**。每个 skill 是一个 `SKILL.md` 文件，文件头用 `---` 包裹一段 YAML 元数据（frontmatter）写 `name` 和 `description`，下面是正文。
 
 ```python
+SKILLS_DIR = WORKDIR / "skills"     # 每个子目录一个 skill
+SKILL_REGISTRY: dict[str, dict] = {}   # name -> {name, description, content}
+
+# _parse_frontmatter(text) -> (meta 字典, 正文)；文件头不是 `---` 开头时返回 ({}, 全文)
 def _scan_skills():
-    """扫描 skills/ 目录，解析每个 SKILL.md 并写入 SKILL_REGISTRY。"""
+    """启动时扫描 skills/ 目录，解析每个 SKILL.md 并写入 SKILL_REGISTRY。"""
     for d in sorted(SKILLS_DIR.iterdir()):
         manifest = d / "SKILL.md"
         if manifest.exists():
             raw = manifest.read_text(encoding="utf-8")
-            meta, body = _parse_frontmatter(raw)          # YAML frontmatter
-            name = meta.get("name", d.name)
-            desc = meta.get("description", ...)
+            meta, body = _parse_frontmatter(raw)
+            name = meta.get("name", d.name)              # 缺失则用目录名
+            desc = meta.get("description", body.split("\n")[0])   # 缺失则用正文首行
             SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
 
+# list_skills() 把 SKILL_REGISTRY 拼成 "- **name**: description" 的多行文本
 def build_system() -> str:
     return (f"You are a coding agent at {WORKDIR}. "
             f"Skills available:\n{list_skills()}\n"
@@ -436,7 +482,7 @@ def load_skill(name: str) -> str:
 
 - **`load_skill` 只接受名字，不接受路径**。`SKILL_REGISTRY` 是启动时构建的查表，`name="../../etc/passwd"` 只会得到 `Skill not found`——因为 name 从来就不是文件路径。这个设计比"收路径再校验"更干净。
 - 拉进来的 skill 内容通过 `tool_result` 进入 `messages`，之后会随历史一直带着，直到被第 8 节的压缩管线处理掉。所以 skill 文件本身不该无限长。
-- 最小实现只解析 `name` / `description`。Claude Code 的 frontmatter 还支持 `when_to_use`、`allowed-tools`、`context`、`model` 等字段。
+- 最小实现只解析 `name` / `description`。Claude Code 的 frontmatter 还支持 `when_to_use`（何时该用）、`allowed-tools`（限定可用工具）、`context`、`model` 等字段。
 
 ---
 
@@ -451,6 +497,10 @@ def load_skill(name: str) -> str:
 **四层管线，按成本从低到高排序**：前三层是纯文本/结构操作，0 次 API 调用；第四层才调 LLM。
 
 ```python
+CONTEXT_LIMIT = 50_000        # 估算字符数超过它就走 L4
+KEEP_RECENT = 3               # L2 保留最近几个 tool_result 的完整内容
+PERSIST_THRESHOLD = 30_000    # L3 单条输出超过它才值得落盘
+
 # L1: snipCompact —— 消息数超限时裁剪中间消息（0 API 调用）
 def snip_compact(messages, max_messages=50):
     if len(messages) <= max_messages: return messages
@@ -461,25 +511,30 @@ def snip_compact(messages, max_messages=50):
             + messages[-keep_tail:])
 
 # L2: microCompact —— 旧 tool_result 换成占位符（0 API 调用）
+# collect_tool_results(messages) 扫全部消息，返回所有 tool_result 块（按时间先后）
 def micro_compact(messages):
     tool_results = collect_tool_results(messages)
-    if len(tool_results) <= KEEP_RECENT: return messages       # KEEP_RECENT = 3
-    for _, _, block in tool_results[:-KEEP_RECENT]:
+    if len(tool_results) <= KEEP_RECENT: return messages
+    for _, _, block in tool_results[:-KEEP_RECENT]:      # 除最近 3 个之外全换
         if len(block.get("content", "")) > 120:
             block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
     return messages
 
 # L3: toolResultBudget —— 超大输出落盘，上下文只留引用 + 预览（0 API 调用）
+# tool_result_budget(messages) 算最新一轮 tool_result 的总字符数，超 200KB 就从最大的
+# 开始依次交给下面的 persist_large_output 落盘，直到降到预算以下
 def persist_large_output(tool_use_id, output):
-    if len(output) <= PERSIST_THRESHOLD: return output          # 30_000 字符
-    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"
+    if len(output) <= PERSIST_THRESHOLD: return output
+    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"       # 写到 .tool_results/
     if not path.exists(): path.write_text(output, encoding="utf-8")
     return (f"<persisted-output>\nFull output: {path}\n"
             f"Preview:\n{output[:2000]}\n</persisted-output>")
 
 # L4: autoCompact —— LLM 全文摘要（1 次 API 调用，最贵）
+# write_transcript(messages)  把完整对话写成 .transcripts/ 下的 jsonl 备份
+# summarize_history(messages) 调一次 LLM 生成摘要，prompt 见下方
 def compact_history(messages):
-    transcript_path = write_transcript(messages)      # 先备份到 .transcripts/
+    transcript_path = write_transcript(messages)
     summary = summarize_history(messages)
     return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 ```
@@ -496,18 +551,21 @@ prompt = ("Summarize this coding-agent conversation so work can continue.\n"
 在循环里的调用顺序是 **L3 → L1 → L2**，然后才判断要不要上 L4：
 
 ```python
+# estimate_size(messages): 粗估 token 用量，直接数序列化后的字符数
+# reactive_compact(messages): 应急压缩，先备份再摘要，保留摘要 + 最近 5 条消息
 messages[:] = tool_result_budget(messages)    # L3: 大结果落盘
 messages[:] = snip_compact(messages)          # L1: 裁中间消息
 messages[:] = micro_compact(messages)         # L2: 旧结果占位符
 
-if estimate_size(messages) > CONTEXT_LIMIT:   # 50_000
+if estimate_size(messages) > CONTEXT_LIMIT:
     messages[:] = compact_history(messages)   # L4
 
 try:
     response = client.messages.create(...)
 except Exception as e:
+    # API 报 prompt 过长：压缩后重试，reactive_retries 限制只能试一次
     if "prompt_too_long" in str(e).lower() and reactive_retries < MAX_REACTIVE_RETRIES:
-        messages[:] = reactive_compact(messages)   # 应急兜底
+        messages[:] = reactive_compact(messages)
         reactive_retries += 1
         continue
     raise
@@ -562,6 +620,8 @@ def write_memory_file(name: str, mem_type: str, description: str, body: str):
 **加载**：两条路径。索引常驻 system prompt（每轮都带，但只有一行描述，token 便宜且能被 prompt cache 命中）；全文按需注入——由 LLM 自己从目录里挑：
 
 ```python
+# select_relevant_memories(messages): 取最近对话的 recent 与全部记忆目录 catalog，
+# 拼成下面的 prompt 让 LLM 选相关项（侧查询）；解析失败则降级为关键词匹配
 prompt = ("Given the recent conversation and the memory catalog below, "
           "select the indices of memories that are clearly relevant. "
           "Return ONLY a JSON array of integers, e.g. [0, 3]. "
@@ -569,20 +629,21 @@ prompt = ("Given the recent conversation and the memory catalog below, "
           f"Recent conversation:\n{recent}\n\nMemory catalog:\n{catalog}")
 ```
 
-调用失败或解析失败就降级为关键词匹配——**不能因为一次 side-query 失败就让整轮挂掉**。
+调用失败或解析失败就降级为关键词匹配——**不能因为一次侧查询（为选记忆额外发起的那次 LLM 调用）失败就让整轮挂掉**。
 
 **维护**：每轮结束时提取新记忆，记忆数 ≥ 10 时触发整理（去重、删过时、按重要性收敛到 30 条以内）。
 
 提取的时机有个细节很关键：
 
 ```python
-# 保存压缩前的消息快照
-pre_compress = [...]
-# 压缩管线（可能已经丢掉细节）
-messages[:] = tool_result_budget(messages)
-...
+# extract_memories(snapshot): 让 LLM 从对话里抽新记忆，写成 .md 文件
+# consolidate_memories(): 记忆数 >= 10 时去重、删过时
+snapshot = list(messages)         # 压缩前浅拷一份，保住完整细节
+messages[:] = tool_result_budget(messages)   # 下面是第 8 节的压缩管线（可能丢细节）
+# ... snip_compact / micro_compact / compact_history ...
+
 if response.stop_reason != "tool_use":
-    extract_memories(pre_compress)   # 从压缩前快照提取，不是从压缩后的
+    extract_memories(snapshot)    # 从压缩前快照提取，不是从压缩后的
     consolidate_memories()
     return
 ```
@@ -663,18 +724,19 @@ def get_system_prompt(context: dict) -> str:
 
 ### 实现
 
-先把恢复状态集中到一个对象里，不散成一堆全局变量：
+先把恢复状态集中到一个对象里，不散成一堆全局变量（`@dataclass` 只是自动生成构造函数，字段后面是初始值）：
 
 ```python
+@dataclass
 class RecoveryState:
-    has_escalated: bool                    # 是否已升级过 max_tokens
-    recovery_count: int                    # 续写次数
-    consecutive_529: int                   # 连续过载次数
-    has_attempted_reactive_compact: bool   # 是否已应急压缩过
-    current_model: str                     # 当前使用的模型
+    has_escalated: bool = False            # 是否已升级过 max_tokens
+    recovery_count: int = 0                # 续写次数
+    consecutive_529: int = 0               # 连续过载次数
+    has_attempted_reactive_compact: bool = False   # 是否已应急压缩过
+    current_model: str = MODEL             # 当前使用的模型
 ```
 
-**路径一：输出截断**。8K 不够先升到 64K，注意这里**不追加**那段半截的输出：
+**路径一：输出截断**。模型一次回复的长度上限由 `max_tokens` 控制，写到一半到顶会被截断（`stop_reason == "max_tokens"`）。8K 不够先升到 64K，注意这里**不追加**那段半截的输出：
 
 ```python
 if response.stop_reason == "max_tokens":
@@ -696,6 +758,8 @@ if response.stop_reason == "max_tokens":
 **路径三：瞬时故障**。指数退避 + 抖动，连续 3 次 529 切备用模型：
 
 ```python
+# retry_delay(attempt): 按下方公式算退避时长；MAX_RETRIES=10，MAX_CONSECUTIVE_529=3
+# FALLBACK_MODEL: 备用模型名，未配置时为空字符串
 def with_retry(fn, state: RecoveryState):
     for attempt in range(MAX_RETRIES):            # 10
         try:
@@ -752,7 +816,7 @@ class Task:
 
 生命周期是三态机：`pending --claim--> in_progress --complete--> completed`。
 
-依赖检查是认领的前置硬约束：
+依赖检查是认领的前置硬约束（下面的 `load_task` / `save_task` / `list_tasks` 就是 `.tasks/` 目录的读写封装，`_task_path(id)` 拼出单个任务的文件路径）：
 
 ```python
 def can_start(task_id: str) -> bool:
@@ -792,11 +856,11 @@ def complete_task(task_id: str) -> str:
 
 ### 要点与取舍
 
-- **`blockedBy` 是硬约束不是建议**。依赖没完成，`claim_task` 直接拒绝。DAG 的语义就是只能从入度为 0 的节点开始。
+- **`blockedBy` 是硬约束不是建议**。依赖没完成，`claim_task` 直接拒绝。任务图本质是一个 DAG（有向无环图），其语义就是只能从入度为 0（无未完成依赖）的节点开始。
 - **依赖文件缺失也算阻塞**，这是保守选择。任务文件被误删时，宁可卡住等人处理，也不要当成"依赖已满足"往下跑。
 - **完成任务不自动启动下游**，只在返回值里告诉 Agent"这几个现在可以做了"。状态转换保持显式，Agent 拿到信息自己决定做哪个——避免隐式连锁反应带来的不可预测性。
 - **TodoWrite 和 Task System 是两层，不是二选一**：前者是 Agent 当前这一轮的执行清单（内存、轻量、高频更新），后者是项目级的目标管理（磁盘、有依赖、跨会话跨 Agent）。Claude Code 两者并存。
-- 最小实现没有环检测，也没有 ID 复用保护（Claude Code 有 highwatermark 文件）。
+- 最小实现没有环检测，也没有 ID 复用保护（Claude Code 用 highwatermark 文件记录已分配过的最大编号，避免新任务复用旧 ID）。
 
 ---
 
@@ -811,6 +875,11 @@ def complete_task(task_id: str) -> str:
 判断是慢操作就丢线程，立刻返回一个占位符：
 
 ```python
+_bg_counter = 0
+background_tasks: dict[str, dict] = {}   # bg_id -> {tool_use_id, command, status}
+background_results: dict[str, str] = {}  # bg_id -> 完成后的输出
+background_lock = threading.Lock()       # 保护上面两个字典
+
 def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
     if tool_name != "bash":
         return False
@@ -831,7 +900,7 @@ def start_background_task(block) -> str:
     bg_id = f"bg_{_bg_counter:04d}"
 
     def worker():
-        result = execute_tool(block)
+        result = execute_tool(block)           # 就是主循环里同一条工具执行路径
         with background_lock:
             background_tasks[bg_id]["status"] = "completed"
             background_results[bg_id] = result
@@ -840,7 +909,7 @@ def start_background_task(block) -> str:
         background_tasks[bg_id] = {"tool_use_id": block.id,
                                    "command": block.input.get("command", block.name),
                                    "status": "running"}
-    threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=worker, daemon=True).start()   # 后台线程跑，不阻塞
     return bg_id
 ```
 
@@ -983,9 +1052,9 @@ class MessageBus:
     """基于文件的消息总线。每个 Agent 一个 .jsonl 收件箱。
     读取即消费：read_text + unlink（取走就删除）。"""
 
-    def send(self, from_agent, to_agent, content, msg_type="message"):
+    def send(self, from_agent, to_agent, content, msg_type="message", metadata=None):
         msg = {"from": from_agent, "to": to_agent, "content": content,
-               "type": msg_type, "ts": time.time()}
+               "type": msg_type, "metadata": metadata or {}, "ts": time.time()}
         with open(MAILBOX_DIR / f"{to_agent}.jsonl", "a") as f:
             f.write(json.dumps(msg) + "\n")
 
@@ -1056,20 +1125,20 @@ Lead 让队友关机，队友回一句"ok"。Lead 怎么知道这个"ok"是回�
 
 ### 实现
 
-给每次交互一个 `request_id`，用状态表追踪：
+给每次交互一个 `request_id`，用状态表追踪。协议消息把 `request_id`、`approve` 等字段放在第 15 节 `send` 新增的 `metadata` 里随消息一起走。
 
 ```python
 @dataclass
 class ProtocolState:
-    request_id: str     # 如 "req_004281"
+    request_id: str     # 贯穿请求-响应的关联键，如 "req_004281"
     type: str           # "shutdown" | "plan_approval"
     sender: str
     target: str
     status: str         # pending | approved | rejected
     payload: str        # 计划文本或关机原因
-    created_at: float
+    created_at: float = field(default_factory=time.time)
 
-pending_requests: dict[str, ProtocolState] = {}
+pending_requests: dict[str, ProtocolState] = {}   # request_id -> 状态
 ```
 
 响应匹配做三关校验：
@@ -1203,7 +1272,7 @@ def idle_poll(agent_name, messages, name, role) -> str:
 ### 要点与取舍
 
 - **收件箱必须先于任务板检查**。反过来的话，任务板一直有活，关机请求就永远排不上——被饿死。控制信令优先于工作信令，这是通用原则。
-- **`claim_task` 的 owner 检查是乐观锁**。两个队友同时扫到同一个任务，先写成功的那个把 `owner` 和 `status` 落盘，第二个再 `claim` 时因为 `status != pending` 被拒。没有文件锁，但能挡住绝大多数竞态。真正的强一致需要文件锁或 CAS。
+- **`claim_task` 的 owner 检查是乐观锁**。两个队友同时扫到同一个任务，先写成功的那个把 `owner` 和 `status` 落盘，第二个再 `claim` 时因为 `status != pending` 被拒。没有文件锁，但能挡住绝大多数竞态。真正的强一致需要文件锁或 CAS（compare-and-swap，"先比对再写入"的原子操作）。
 - **身份重注入**：上下文压缩之后，队友可能"忘了自己是谁"（name 和 role 在早期消息里，被压掉了）。所以每次恢复工作时重新注入身份信息。这个坑在长时间运行的 Agent 上一定会遇到。
 - **超时退出而不是永久驻留**：60 秒没活就发个 summary 退出，避免一堆空转线程。Claude Code 是等到显式关机请求才退。
 
@@ -1228,10 +1297,12 @@ worktree: str | None    # 绑定的 worktree 名称
 创建流程五步，第一步是安全校验：
 
 ```python
+# run_git(args): 封装 subprocess 跑 git，返回 (是否成功, 输出)
+# log_event(action, name, task_id=""): 向 events.jsonl 追写一条审计事件
 VALID_WT_NAME = re.compile(r'^[A-Za-z0-9._-]{1,64}$')
 
 def create_worktree(name: str, task_id: str = "") -> str:
-    err = validate_worktree_name(name)          # ① 白名单正则校验
+    err = validate_worktree_name(name)          # ① 白名单正则校验（匹配 VALID_WT_NAME）
     if err: return f"Error: {err}"
     path = WORKTREES_DIR / name
     if path.exists(): return f"Worktree '{name}' already exists at {path}"
@@ -1301,7 +1372,7 @@ wt_ctx = {"path": None}     # 用 dict 而不是 nonlocal，闭包内可改
 
 ### 实现
 
-MCP（Model Context Protocol）的客户端侧模型：一个 `MCPClient` 管一个外部服务的工具发现和调用。
+MCP（Model Context Protocol，一种让外部服务向 Agent 暴露工具的开放协议）的客户端侧模型：一个 `MCPClient` 管一个外部服务的工具发现和调用。
 
 ```python
 class MCPClient:
@@ -1327,6 +1398,8 @@ class MCPClient:
 工具池改成运行时组装：
 
 ```python
+# BUILTIN_TOOLS / BUILTIN_HANDLERS: 前 18 节的内置工具定义表与 handler 表
+# mcp_clients: dict[str, MCPClient]，已连接的外部服务，connect_mcp 时写入
 _DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
 
 def normalize_mcp_name(name: str) -> str:
@@ -1364,7 +1437,7 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
 
 代价也很明确：**第 10 节的 system prompt 缓存在这一层被移除了**。工具列表进 prompt，工具池动态变化后缓存必然失效，硬留着只会产生"模型看到的工具列表和实际能调的不一致"这种极难排查的 bug。**正确性优先于优化。**
 
-最小实现用 mock handler 代替了真实 MCP 协议。生产实现还要处理 transport（stdio / SSE / HTTP）、OAuth 授权、资源订阅与轮询，以及外部服务不可用时的降级策略。
+最小实现用 mock handler（本地模拟的假服务函数）代替了真实 MCP 协议。生产实现还要处理 transport（stdio / SSE / HTTP 三种传输方式）、OAuth 授权、资源订阅与轮询，以及外部服务不可用时的降级策略。
 
 ---
 
@@ -1380,6 +1453,8 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
 - **4 个 hook 事件**：`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`
 
 ### 主循环的 7 步
+
+下面代码里几个辅助函数都是前面各节机制的封装：`consume_cron_queue` 取出到点的定时任务（第 14 节），`inject_background_notifications` 注入后台完成通知（第 13 节），`prepare_context` 跑第 8 节的四层压缩，`call_llm` 用第 11 节的 `with_retry` 包住模型调用，`has_tool_use` / `call_tool_handler` / `build_user_content` 分别是"本轮有无工具调用"判定、单个工具执行、把 tool_result 与后台通知合并成一条 user 消息。
 
 ```python
 def agent_loop(messages: list, context: dict):
