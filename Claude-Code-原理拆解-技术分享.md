@@ -89,6 +89,16 @@ LLM 能输出一条 shell 命令，但它不会自己执行，也看不到执行
 
 本质就是 ReAct 设计框架 = Thought（思考/推理）+ Action（行动）+ Observation（观察）。对应到下面的代码：模型输出 = Thought + Action，`tool_result` 回传 = Observation。
 
+```mermaid
+flowchart TD
+    U[用户输入] --> M["调 LLM：Thought + Action"]
+    M --> D{stop_reason<br/>== tool_use?}
+    D -->|否| E[返回最终回复]
+    D -->|是| T["执行工具 run_bash"]
+    T --> R["tool_result 回灌 messages：Observation"]
+    R --> M
+```
+
 
 ```python
 def agent_loop(messages: list):
@@ -192,6 +202,18 @@ output = handler(**block.input) if handler else f"Unknown: {block.name}"
 ### 实现
 
 把权限从工具里抽出来，做成独立的三级管线：
+
+```mermaid
+flowchart TD
+    A[工具调用] --> G1{Gate 1<br/>bash 命中黑名单?}
+    G1 -->|是| DENY[拒绝]
+    G1 -->|否| G2{Gate 2<br/>命中规则?}
+    G2 -->|否| PASS[放行执行]
+    G2 -->|是| G3{Gate 3<br/>用户审批 y/N}
+    G3 -->|拒绝/回车| DENY
+    G3 -->|允许| PASS
+    DENY --> RESULT["拒绝理由作为 tool_result 回传"]
+```
 
 ```python
 # Gate 1 的硬黑名单：命令中含任一字串就无条件拒绝
@@ -496,6 +518,19 @@ def load_skill(name: str) -> str:
 
 **四层管线，按成本从低到高排序**：前三层是纯文本/结构操作，0 次 API 调用；第四层才调 LLM。
 
+```mermaid
+flowchart TD
+    S[每轮调 LLM 前] --> L3["L3 tool_result_budget<br/>超大输出落盘（0 API）"]
+    L3 --> L1["L1 snip_compact<br/>裁中间消息（0 API）"]
+    L1 --> L2["L2 micro_compact<br/>旧结果换占位符（0 API）"]
+    L2 --> C{估算字符数<br/>&gt; CONTEXT_LIMIT?}
+    C -->|否| CALL[调 LLM]
+    C -->|是| L4["L4 compact_history<br/>LLM 全文摘要（1 API）"]
+    L4 --> CALL
+    CALL -.->|报 prompt_too_long| RC["reactive_compact 应急兜底<br/>摘要 + 最近 5 条后重试"]
+    RC -.-> CALL
+```
+
 ```python
 CONTEXT_LIMIT = 50_000        # 估算字符数超过它就走 L4
 KEEP_RECENT = 3               # L2 保留最近几个 tool_result 的完整内容
@@ -723,6 +758,22 @@ def get_system_prompt(context: dict) -> str:
 生产环境里 API 调用不可能永远成功。429 限流、529 过载、网络抖动、输出被 `max_tokens` 截断——最小实现遇到这些直接抛异常退出，真实系统必须能自己爬起来。
 
 ### 实现
+
+三类错误对应三条独立的恢复路径：
+
+```mermaid
+flowchart TD
+    CALL[调 LLM] --> ERR{出什么错?}
+    ERR -->|输出截断 max_tokens| P1{升级过 64K?}
+    P1 -->|否| ESC[升到 64K 重试<br/>不追加半截输出]
+    P1 -->|是| CONT[保留输出 + 续写提示<br/>最多 3 次]
+    ERR -->|上下文超限 prompt_too_long| P2[reactive_compact<br/>压缩后重试一次]
+    ERR -->|瞬时故障 429/529| P3[指数退避 + 抖动重试<br/>连续 3 次 529 切备用模型]
+    ESC --> CALL
+    CONT --> CALL
+    P2 --> CALL
+    P3 --> CALL
+```
 
 先把恢复状态集中到一个对象里，不散成一堆全局变量（`@dataclass` 只是自动生成构造函数，字段后面是初始值）：
 
@@ -1127,6 +1178,17 @@ Lead 让队友关机，队友回一句"ok"。Lead 怎么知道这个"ok"是回�
 
 给每次交互一个 `request_id`，用状态表追踪。协议消息把 `request_id`、`approve` 等字段放在第 15 节 `send` 新增的 `metadata` 里随消息一起走。
 
+```mermaid
+sequenceDiagram
+    participant L as Lead
+    participant A as 队友 alice
+    L->>L: 创建 ProtocolState（status=pending）
+    L->>A: shutdown_request（带 request_id）
+    A->>A: idle loop 轮询到关机请求
+    A->>L: shutdown_response（回传同一 request_id）
+    L->>L: match_response 三关校验<br/>status → approved
+```
+
 ```python
 @dataclass
 class ProtocolState:
@@ -1220,6 +1282,20 @@ if response.stop_reason != "tool_use":
 ### 实现
 
 **WORK / IDLE 双阶段生命周期**。WORK 阶段最多 10 轮 LLM 调用，跑完进 IDLE 轮询等活。
+
+```mermaid
+stateDiagram-v2
+    [*] --> WORK
+    WORK --> IDLE: 干完 10 轮 / 无工具调用
+    IDLE --> WORK: 收件箱有新消息 / 认领到新任务
+    IDLE --> [*]: 收到关机请求 / 60s 超时
+    note right of IDLE
+        idle_poll 三通道（每 5s，共 60s）：
+        ① 收件箱（协议消息优先）
+        ② 扫任务板自动认领
+        ③ 超时退出
+    end note
+```
 
 扫描可认领任务的三个条件缺一不可：
 
@@ -1455,6 +1531,19 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
 ### 主循环的 7 步
 
 下面代码里几个辅助函数都是前面各节机制的封装：`consume_cron_queue` 取出到点的定时任务（第 14 节），`inject_background_notifications` 注入后台完成通知（第 13 节），`prepare_context` 跑第 8 节的四层压缩，`call_llm` 用第 11 节的 `with_retry` 包住模型调用，`has_tool_use` / `call_tool_handler` / `build_user_content` 分别是"本轮有无工具调用"判定、单个工具执行、把 tool_result 与后台通知合并成一条 user 消息。
+
+```mermaid
+flowchart TD
+    S1["① 注入定时任务 + 后台通知<br/>（13/14 节）"] --> S2["② todo 提醒<br/>（05 节）"]
+    S2 --> S3["③ 上下文四层压缩<br/>（08 节）"]
+    S3 --> S4["④ 组装工具池 + system prompt<br/>（10/19 节）"]
+    S4 --> S5["⑤ 调 LLM（with_retry 错误恢复）<br/>（11 节）"]
+    S5 --> S6{有 tool_use?}
+    S6 -->|否| STOP[触发 Stop hooks → 返回]
+    S6 -->|是| S7["⑥ 逐个执行：compact 截获 → 权限闸门<br/>→ 后台分发 → 工具执行（03/04/13 节）"]
+    S7 --> S8["⑦ 合并 tool_result + 后台通知<br/>追加 messages"]
+    S8 --> S1
+```
 
 ```python
 def agent_loop(messages: list, context: dict):
