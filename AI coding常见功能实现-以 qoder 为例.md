@@ -219,4 +219,163 @@ exit 0
 
 ---
 
-<!-- 后续小节（05–20）将按批次补充 -->
+## 05 TodoWrite：自动生成的待办列表
+
+> 原理篇第 05 节：复杂任务中 Agent 容易丢步骤、跑偏方向，需要一个外挂的"工作记忆"——把计划显式写成清单，做一项勾一项。
+
+这个机制在 Qoder 中是**内置且自动的**，不需要任何配置：当你给出一个多步骤的复杂任务时，Qoder 会先自己创建一份待办列表（Todo List），把任务拆成若干条目，然后逐条执行并实时更新状态（待处理 / 进行中 / 已完成）。
+
+**怎么触发**：
+
+- 给一个**多步骤任务**即可，例如："帮我重构 xxx 模块，补齐单元测试，并更新对应文档"——步骤越多、目标越复合，越容易触发；
+- 简单的单步请求（如"这个函数是干什么的"）通常不会出现待办列表；
+- 执行过程中可以直接在界面上看到列表的创建与逐项勾选，也可以在中途追加要求，它会更新清单继续执行。
+
+**日常使用价值**：待办列表是可观察的"执行计划"——任务跑偏时你能第一时间看到它打算做什么、做到哪一步，及时打断纠正；这也是长任务在上下文压缩后仍能继续推进的原因之一（清单本身就是持久化的计划锚点，见第 08 节）。
+
+> 注意区分：这里的待办列表是当前会话内的执行清单；跨会话、带依赖的项目级任务管理是另一层能力，见第 12 节任务系统。
+
+<!-- 截图：一次复杂任务中 Qoder 自动创建的待办列表（含状态更新过程） -->
+
+---
+
+## 06 Subagent：子代理
+
+> 原理篇第 06 节：子 Agent 用独立上下文执行子任务，只把结果带回主会话——隔离的是上下文，不是权限。
+
+Qoder 的子代理（Subagent）是专门处理某类任务的 Agent，可以拥有自己的系统提示词、工具集合、模型配置、权限模式、运行限制和 Hook。适合把代码探索、方案设计、接口审查这类工作拆给更聚焦的执行者，避免大量中间搜索过程塞进主会话上下文。
+
+### 内置子代理
+
+开箱即用的常用内置子代理：
+
+| 名称 | 能力 |
+|---|---|
+| `general-purpose` | 通用研究：复杂搜索、多文件分析、多步骤任务；未显式指定时的默认选择 |
+| `Explore` | 只读代码探索：查文件、搜符号、理解现有实现 |
+| `Plan` | 只读方案设计：梳理实现路径、关键文件与依赖顺序 |
+
+### 怎么调用
+
+- **显式调用**（最稳定）：直接写出名称，例如 `使用 api-reviewer subagent 审查这个接口设计`，或 `@api-reviewer 审查这个接口设计`；
+- **隐式调用**：直接描述任务（如"帮我做一次接口设计审查"），Qoder 根据子代理的 `description` 自动选择；
+- **作为主 Agent**：`qoder --agent api-reviewer` 启动时把某个子代理作为本次会话的主 Agent；
+- **编排多个**：`先使用 general-purpose subagent 检查实现方案，再使用 api-reviewer subagent 审查 API 设计`；彼此独立的任务可以要求并行调度。
+
+### 怎么自定义
+
+推荐用 AI 辅助生成：`/agents` 打开配置面板 → 切换到 User 或 Project 标签页 → Create new agent → 用自然语言描述需求，自动生成配置文件后再微调。
+
+也可以手动编写 Markdown 配置，YAML frontmatter 声明配置、正文就是系统提示词：
+
+```markdown
+<!-- 项目级：.qoder/agents/api-reviewer.md（随仓库提交）
+     用户级：~/.qoder/agents/api-reviewer.md（所有项目生效） -->
+---
+name: api-reviewer
+description: Review API designs, endpoint naming, status codes, and versioning.
+tools: [Read, Grep, Glob]
+permissionMode: default
+maxTurns: 8
+---
+
+You are an API design reviewer.
+
+Focus on resource naming, request method semantics, status code
+consistency, and versioning. Return findings grouped by severity.
+```
+
+修改配置后可用 `/agents reload` 重新加载。需要子代理在独立工作目录中改动代码时，frontmatter 加一行 `isolation: worktree`（worktree 隔离见第 18 节）。
+
+**官方文档**：<https://docs.qoder.com/zh/cli/subagent>
+
+<!-- 截图：/agents 配置面板（BuiltIn / User / Project 标签页） -->
+
+---
+
+## 07 Skill Loading：Skills 按需加载
+
+> 原理篇第 07 节：知识不能全塞进上下文——名称和描述常驻，正文按需加载，越用越深。
+
+Qoder 的技能（Skill）正是这套机制的产品形态：每个 Skill 是一个包含 `SKILL.md` 的目录，把专业知识和工作流打包成可复用能力。
+
+**加载机制**（与原理篇逐层对应）：
+
+1. 启动时只加载每个 Skill 的**名称和描述**，不占多少上下文；
+2. 用户请求与某个描述匹配时，模型决定加载该 Skill 的**完整 SKILL.md**；
+3. 执行中再按需读取 Skill 目录里的引用文件、运行脚本——渐进式披露，越用越深。
+
+**怎么触发**：模型根据请求内容自动判断（`description` 里写清用户常用的关键词能显著提高命中率），也可以输入 `/skill-name` 显式加载。内置 Skills 如 `/simplify`（代码简化审查）、`/debug`（调试助手）、`/security-scan`（安全扫描）等可直接使用。
+
+### 怎么创建
+
+第一步，建目录。用户级对所有项目生效，项目级随仓库共享给团队：
+
+```bash
+# 用户级：~/.qoder/skills/{skill-name}/SKILL.md
+# 项目级：.qoder/skills/{skill-name}/SKILL.md
+mkdir -p ~/.qoder/skills/api-doc-generator
+```
+
+第二步，编写 `SKILL.md`——YAML 元数据（`name` 和 `description` 必填）+ Markdown 指令：
+
+```markdown
+---
+name: api-doc-generator
+description: Generate comprehensive API documentation from code. Use when creating API docs or generating OpenAPI specs.
+---
+
+# API Documentation Generator
+
+When generating API documentation:
+1. Identify all API endpoints and routes
+2. Document request/response formats
+3. Include authentication requirements
+4. Add example requests and responses
+```
+
+第三步，验证。新会话启动时自动加载；已在运行的会话用 `/skills reload` 刷新，输入 `/skills` 查看可用列表。
+
+目录里还可以放辅助文件（参考文档、脚本、模板），在 `SKILL.md` 中引用即可。集团内部同学也可以在 **Aone 开放平台**（<https://open.aone.alibaba-inc.com/market>，内网）上查找现成的 Skill 与工具资源直接安装使用。
+
+**官方文档**：<https://docs.qoder.com/zh/cli/Skills>
+
+<!-- 截图：/skills 列出的可用技能 -->
+
+---
+
+## 08 Context Compact：上下文管理
+
+> 原理篇第 08 节：上下文窗口有限，需要分层压缩策略——便宜的先跑，尽量保住关键信息。
+
+Qoder 把上下文管理做成了几个日常可用的操作：
+
+| 操作 | 作用 |
+|---|---|
+| `/compact` | 主动压缩当前对话上下文，释放窗口空间 |
+| `/context` | 查看当前上下文的构成（各部分占比） |
+| `/rewind` | 回退到检查点，恢复对话和/或文件改动 |
+
+**自动与手动**：上下文接近上限时 Qoder 会自动触发压缩（生成摘要、腾出空间），你通常无感知；长会话中也可以主动 `/compact` 提前压缩，或先 `/context` 看一眼空间还剩多少。
+
+**`/rewind` 检查点恢复**：Qoder 以对话中的每条用户消息为检查点，记录其后的文件编辑历史。输入 `/rewind` 打开回退界面，选择检查点后会显示影响范围（例如"将还原 3 个文件（+42 -17）"），确认时可选三种恢复范围：
+
+- 恢复对话和文件（默认）；
+- 仅恢复对话（文件保持现状）；
+- 仅恢复文件（对话保持现状）。
+
+两个使用提醒：回退只覆盖 Qoder 通过文件编辑工具产生的改动，手动编辑或 Shell 命令的改动可能不在管辖范围；重要改动配合 Git 提交更稳妥。
+
+**回退 vs 分支**：想"就地回到过去"用 `/rewind`；想在保留原会话的前提下从某个节点探索新方向，用 `/branch`（或启动时 `--fork-session`）岔出一条新路。
+
+**官方文档**：
+
+- 管理会话：<https://docs.qoder.com/zh/cli/sessions>
+- 撤销与恢复：<https://docs.qoder.com/zh/cli/undo-restore>
+
+<!-- 截图：/context 显示的上下文构成 -->
+<!-- 截图：/rewind 回退界面（含影响范围提示） -->
+
+---
+
+<!-- 后续小节（09–20）将按批次补充 -->
