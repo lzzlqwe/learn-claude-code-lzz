@@ -402,7 +402,7 @@ def agent_loop(messages: list):
 
 ### 实现
 
-派生一个带**干净 `messages`** 的独立循环，跑完只把最后的文本结论带回来，中间过程全部丢弃：
+主 Agent 多了一个 task 工具，可以派生一个带**干净 `messages`** 的独立循环（subAgent），跑完只把最后的文本结论带回来，中间过程全部丢弃：
 
 ```python
 # 子 Agent 专用的三个常量：
@@ -441,11 +441,11 @@ def spawn_subagent(description: str) -> str:
     return result
 ```
 
-三个设计点值得单独说：
+三个主要的设计点：
 
-1. **禁止递归靠"没有这个工具"，不靠判断层数**。`SUB_TOOLS` 里根本没有 `task` 工具，模型看不到它，自然调不出来。这是硬约束，比"检查 depth < 3"更可靠。
+1. **禁止递归靠"没有 task 工具"，不靠判断层数**。`SUB_TOOLS` 里根本没有 `task` 工具，模型看不到它，自然调不出来。这是硬约束，比"检查 depth < 3"更可靠。
 2. **上下文隔离 ≠ 权限隔离**。子 Agent 的每次工具调用同样走 `PreToolUse` hook。隔离的是"看到什么"，不是"能干什么"。
-3. **返回值是摘要，不是历史**。回传 `messages` 会把隔离的意义全部抵消。
+3. **返回值是摘要，不是历史**。如果回传 `messages` 会丢失隔离的意义。
 
 ### 要点与取舍
 
@@ -457,11 +457,11 @@ def spawn_subagent(description: str) -> str:
 
 ### 问题
 
-有 10 份领域文档要给 Agent 用。全塞进 system prompt，每轮请求都要付这些 token；不塞，Agent 根本不知道这些文档存在。
+有 10 份领域文档要给 Agent 用。如果全塞进 system prompt，每轮请求都要消耗这些 token；不塞的话，Agent 根本不知道这些文档存在。
 
 ### 实现
 
-两级加载。第一级把**目录**（名称 + 一行描述）注入 system prompt，第二级由 Agent 自己调工具拉**全文**。每个 skill 是一个 `SKILL.md` 文件，文件头用 `---` 包裹一段 YAML 元数据（frontmatter）写 `name` 和 `description`，下面是正文。
+两级加载。第一级把**目录**（名称 + 一行描述）注入 system prompt，第二级由 Agent 自己调 load_skill 工具拉**全文**。每个 skill 是一个 `SKILL.md` 文件，文件头用 `---` 包裹一段 YAML 元数据（frontmatter）写 `name` 和 `description`，下面是正文。
 
 ```python
 SKILLS_DIR = WORKDIR / "skills"     # 每个子目录一个 skill
