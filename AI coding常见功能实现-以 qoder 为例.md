@@ -158,11 +158,25 @@ Hooks 允许在 Qoder 的关键节点介入执行流，且与 CLI 本身解耦�
 | 事件 | 触发时机 | 可否阻塞 |
 |---|---|---|
 | `PreToolUse` | 工具调用前 | ✅ 可拦截 |
+| `PermissionRequest` | 权限判定为 ask、弹窗确认前 | —（可自动批准/拒绝） |
 | `PostToolUse` | 工具调用成功后 | —（做副作用） |
 | `SessionStart` | 会话开始 | —（注入上下文） |
 | `Stop` | 主 Agent 停止响应时 | — |
 
-### 退出码契约（关键知识）
+### Hook 与权限决策
+
+Hook 有两个直接参与权限链路的注入点（其他事件如 `PostToolUse`、`SessionStart` 不参与权限决策）：
+
+整体执行顺序：
+
+1. Hook `PreToolUse` —— 返回 allow/deny 则短路；
+2. 权限管道（规则 + 模式 + 安全检查，见第 03 节）；
+3. 结果为 `ask` 时 → Hook `PermissionRequest` —— 返回 allow/deny 则短路；
+4. 最终由运行环境消费 `ask`（弹窗确认 / headless 下拒绝 / 回调）。
+
+关键点：**Hook 的权限决策优先级高于权限模式**——即使在 `bypass_permissions` 模式下，`PreToolUse` 返回 `deny` 依然会阻止执行。这为组织级安全策略提供了不可绕过的拦截能力。
+
+### 退出码契约
 
 Hook 脚本通过 stdin 接收 JSON 输入，通过退出码控制行为：
 
@@ -170,21 +184,17 @@ Hook 脚本通过 stdin 接收 JSON 输入，通过退出码控制行为：
 - `exit 2`：**阻塞**本次操作，stderr 内容会作为反馈返回给 Agent——写清"为什么被拦 + 应该怎么做"，Agent 看到后会自己换做法；
 - 其他退出码：非阻塞错误，记录但不中断。
 
-### 示例：拦截危险命令
+### 示例：权限弹窗前播放提示音（PermissionRequest）
 
-第一步，创建脚本 `~/.qoder/hooks/block-rm.sh`：
+日常使用中的真实痛点：把 Qoder 挂在后台干活，自己去处理别的事，等回来才发现它早就停在权限确认弹窗上等了半天。用 `PermissionRequest` hook 可以在每次需要授权时播放一段系统提示音：
+
+第一步，创建脚本 `~/.qoder/hooks/notify-ask.sh`：
 
 ```bash
 #!/bin/bash
-input=$(cat)
-command=$(echo "$input" | jq -r '.tool_input.command')
-
-if echo "$command" | grep -q 'rm -rf'; then
-  echo "危险命令已被阻止: $command" >&2
-  exit 2
-fi
-
-exit 0
+cat > /dev/null                     # 读掉 stdin，防止管道阻塞
+afplay /System/Library/Sounds/Glass.aiff   # macOS 系统自带提示音
+exit 0                              # 不输出 JSON，ask 继续走正常弹窗流程
 ```
 
 第二步，在 `~/.qoder/settings.json` 中注册：
@@ -192,11 +202,10 @@ exit 0
 ```json
 {
   "hooks": {
-    "PreToolUse": [
+    "PermissionRequest": [
       {
-        "matcher": "Bash",
         "hooks": [
-          { "type": "command", "command": "~/.qoder/hooks/block-rm.sh" }
+          { "type": "command", "command": "~/.qoder/hooks/notify-ask.sh" }
         ]
       }
     ]
@@ -204,7 +213,9 @@ exit 0
 }
 ```
 
-第三步，启动 Qoder CLI，让它执行一条包含 `rm -rf` 的命令，验证被拦截且 Agent 收到了原因说明。
+第三步，启动 Qoder CLI，让它执行一条会触发权限确认的操作（如安装依赖），听到提示音回到终端处理弹窗即可。
+
+这个脚本故意不输出任何 JSON：hook 不做决策，ask 照常弹窗，只起提醒作用。想换成语音播报，把 `afplay` 一行换成 `say "Qoder 需要你的确认"` 即可。
 
 ### 使用提醒
 
@@ -215,7 +226,7 @@ exit 0
 
 **官方文档**：<https://docs.qoder.com/zh/cli/hooks>
 
-<!-- 截图：hook 拦截生效的会话现场（exit 2 + stderr 反馈回到对话） -->
+<!-- 截图：触发权限确认时 hook 播放提示音的会话现场（PermissionRequest 生效） -->
 
 ---
 
