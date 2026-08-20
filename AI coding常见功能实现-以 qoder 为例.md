@@ -2,7 +2,7 @@
 >
 > **阅读方式**：全文 20 个小节，与原理篇的 20 个章节一一对应。每节先一句话说明原理篇对应章节在解决什么问题，再介绍 Qoder 中的对应功能、触发或配置方式，并给出官方文档链接。
 >
-> **说明**：（1）文中截图位置以占位标记给出，后续补充实际截图。（2）Qoder 产品迭代较快，文中命令、默认值与行为以撰写时版本为准，落地前建议对照官方文档确认。
+> **说明**：（1）Qoder 产品迭代较快，文中命令、默认值与行为以撰写时版本为准，落地前建议对照官方文档确认。（2）截图基于撰写时的实际使用环境，界面可能随版本变化。
 >
 
 ---
@@ -21,7 +21,7 @@
 | 09 | Memory | 记忆 | 项目说明文件 + 规则 + 自动记忆 |
 | 10 | System Prompt | 上下文自动组装 | 规则、记忆、Skill 在运行时分层注入 |
 | 11 | Error Recovery | 错误自愈 | 失败信息回灌自动重试 + 检查点恢复 |
-| 12 | Task System | 任务与看板 | `/tasks` `/kanban` 管理持久化任务 |
+| 12 | Task System | 任务系统 | TaskCreate 等 4 个内置工具管理任务图，带状态与依赖 |
 | 13 | Background Tasks | 后台执行 | 慢命令丢后台、后台子代理 |
 | 14 | Cron Scheduler | 定时任务 | 自然语言创建，cron 表达式触发 |
 | 15 | Agent Teams | 多智能体协作 | Agent Teams（beta） |
@@ -431,5 +431,165 @@ Qoder 把上下文管理做成了几个日常可用的操作：
 
 + 管理会话：[https://docs.qoder.com/zh/cli/sessions](https://docs.qoder.com/zh/cli/sessions)
 + 撤销与恢复：[https://docs.qoder.com/zh/cli/undo-restore](https://docs.qoder.com/zh/cli/undo-restore)
+
+---
+
+## 09 Memory：让它记住项目约定
+> 原理篇第 09 节：压缩会丢细节，需要一层不丢的——把跨会话有效的知识落到磁盘，下次会话重新加载。
+>
+
+Qoder 每次会话都会重新构造上下文，跨会话保留的知识来自两类记忆：
+
+| 机制 | 谁来写 | 适合内容 | 查看入口 |
+| --- | --- | --- | --- |
+| 静态记忆 | 用户或团队 | 包括 AGENTS.md 和 rules。明确、稳定的约定：构建命令、目录结构、代码风格、协作流程 | `/memory` |
+| 自动记忆 | Qoder CLI | 从对话中学到的偏好、反馈、项目背景 | `/memory`打开 auto-memory folder；`/memory manage`管理主题文件 |
+
+
+### 静态记忆：AGENTS.md 与 rules
+四个常用位置（注意是否适合 git 提交）：
+
++ `~/.qoder/AGENTS.md`——个人跨项目偏好，不提交；
++ `<project>/AGENTS.md`——团队共享的项目规则与架构说明，提交；
++ `<project>/AGENTS.local.md`——本机私有（本地服务地址等），不提交；
++ `<project>/.qoder/rules/**/*.md`——按主题或文件范围拆分的 Markdown 规则文件，适合替代单个臃肿的 AGENTS.md，提交。
+
+新项目可以直接 `/init` 生成 AGENTS.md 初始版本。
+
+### 自动记忆
+Qoder 会把值得跨会话复用的信息保存为本机 Markdown（记忆比如偏好、反馈、项目背景、外部资料位置）。它是本机文件、不随代码提交、也可能过期。
+
++ Qoder IDE 和 JetBrains 插件默认开启自动记忆。它会自动记忆一些信息。
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787144243005-c0d50a1d-d782-4c54-939e-90185c4659aa.png" width="1894" title="" crop="0,0,1,1" id="CgbMS" class="ne-image">
+
++ qoderCli默认关闭自动记忆。可以通过`/settings` 搜索 Auto Memory，或 settings.json 中 `"autoMemoryEnabled": true`。
+
+### 自动记忆存储位置
+项目级自动记忆保存在当前项目对应的 Qoder 配置目录下：
+
+```latex
+~/.qoder/projects/<project>/memory/
+```
+
+启用用户级自动记忆后，还会使用：
+
+```latex
+~/.qoder/memory/
+```
+
+每个自动记忆目录包含一个 `MEMORY.md` 索引和若干主题文件：
+
+```latex
+memory/
+├── MEMORY.md
+├── user-preferences.md
+├── feedback-testing.md
+└── project-release-context.md
+```
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787145246375-62ef23a6-6b10-4c0e-a8ec-e0a5436f74c0.png" width="1392" title="" crop="0,0,1,1" id="unN6B" class="ne-image">
+
+`MEMORY.md` 是索引，用于加载进 System prompt。Qoder CLI 启动时会读取每个活跃自动记忆根的 `MEMORY.md`，最多读取前 200 行或约 25KB。更详细的内容应放在单独的主题文件中，由索引指向。
+
+注意：Qoder IDE 和 JetBrains 的自动记忆存储位置不在上述路径，具体路径如下：
+
+```latex
+~/.qoder/memories/xxx/global  # 用户级目录
+~/.qoder/memories/xxx/projects/<project>/  # 项目级目录
+```
+
+**官方文档**：
+
+1. [https://docs.qoder.com/zh/cli/memory](https://docs.qoder.com/zh/cli/memory)
+2. [https://docs.qoder.com/zh/cli/how-memory-works](https://docs.qoder.com/zh/cli/how-memory-works)
+
+---
+
+## 10 System Prompt：上下文是运行时组装的
+> 原理篇第 10 节：系统提示词不是写死的常量，而是每次会话按当前环境运行时拼装。
+>
+
+Qoder 同样如此——每次会话重新构造上下文，把多层来源按当前环境拼装注入：基础指令（角色，职责这些）、记忆与规则（AGENTS.md、按触发方式加载的 rules）、工具定义与 Skills 元信息、MCP 工具、对话历史。前面几节的机制在这里合流：
+
++ 第 02 节的工具、第 07 节的 Skill 元信息——常驻拼接；
++ 第 09 节的记忆与规则——按触发方式分层注入；
++ 第 08 节的压缩——窗口吃紧时对历史做摘要。
+
+用户侧的作用：**你能控制的不是提示词本身，而是注入它的原材料**——写好 AGENTS.md、规则和 Skill 描述，组装结果自然变好。几个观察/调试入口：
+
++ `/context`：查看当前上下文的构成与占比；
++ 规则改完下一轮即生效，不用重启——组装是每轮动态的。
++ 每轮循环开头拿一次 system prompt。context 变了就重新组装，没变就返回缓存。
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787193330718-e477386b-6d07-4d01-a906-662fffbb70ac.png" width="788" title="" crop="0,0,1,1" id="VP2qQ" class="ne-image">
+
+这里当前项目下没有记忆文件，那就不需要动态拼接。
+
+---
+
+## 11 Error Recovery：出错之后怎么办
+> 原理篇第 11 节：错误分三类（工具失败、模型输出损坏、外部故障），各有恢复路径；核心是"把错误信息喂回去，让模型自己纠正"。
+>
+
+Qoder 的日常使用中有三个能直接感知到的恢复机制：
+
++ **工具失败自动重试**：命令报错、测试失败、路径不存在时，错误输出会作为观察回灌给模型，它通常自己分析原因换一种做法重试——你看到的"它发现报错 → 读日志 → 再改一版"就是这个机制在工作；对应的扩展点是 `PostToolUseFailure` hook（工具失败后触发）；
++ **检查点回退**：反复重试仍走错方向时，用 `/rewind` 回到分岔前重新描述需求（见第 08 节），比在错误路径上继续追加上下文更省成本也更有效；
++ **会话分支**：想保留当前会话另试一条路，用 `/branch` 岔出新会话。
+
+使用建议：让它跑测试/构建命令验证自己的改动（错误信息越完整，自愈越有效）；卡住超过几轮时主动介入——回退或补充信息，而不是任它反复重试烧上下文。
+
+---
+
+## 12 Task System：项目级任务与看板
+> 原理篇第 12 节：TodoWrite 是进程内清单，退出就没了；项目级需要落盘的任务图——有状态、有依赖、跨会话跨 Agent。
+>
+
++ Qoder 的 task (任务列表) 功能用到 4 个内置工具：
+
+| 工具 | 用途 | 典型操作 |
+| :--- | :--- | :--- |
+| TaskCreate | 创建任务 | 传入 subject (标题)、description (详情)、可选 activeForm (进行中时的 spinner 文案)，新任务默认为 pending |
+| TaskList | 列出全部任务 | 查看所有任务的 id、标题、状态、依赖 (blockedBy) |
+| TaskGet | 获取单个任务详情 | 读取完整描述、评论、blocks/blockedBy 依赖关系 |
+| TaskUpdate | 更新任务 | 改状态 (pending → in_progress → completed)、设置依赖 (addBlocks/addBlockedBy)、认领 owner、删除 (status: deleted) |
+
+
+**状态流转：**
+
+pending → in_progress → completed。
+
++ 开始处理某任务时置为 `in_progress`，验证通过后立即置为 `completed`
++ 通过 `addBlockedBy` 声明依赖：被阻塞的任务在前置任务完成前不可认领
+
+**存储位置：**
+
+按会话隔离存储，会话结束即失效 (`/resume` 恢复会话时一并恢复)：
+
+```plain
+~/.qoder/tasks/<session-id>/
+├── 1.json              # 每个任务一个 JSON 文件 (id/subject/description/status/blocks/blockedBy...)
+├── .highwatermark      # 任务 ID 自增水位
+├── .lock               # 会话级锁
+└── .task-locks/        # 任务级锁：<taskId>.lease
+```
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787210910520-e3ed4dd6-cc34-468f-a74b-ae650fc0d1ab.png" width="1348" title="" crop="0,0,1,1" id="TYIAw" class="ne-image">
+
+会话的完整对话日志另存于 `~/.qoder/projects/<项目路径编码>/<session-id>.jsonl`，任务工具的每次调用也记录在其中。
+
+**会话锁和任务锁：**
+
++ 会话锁 `.lock`：保证同一会话的任务存储不会被并发写入破坏
++ 任务锁 `.task-locks/<id>.lease`：租约式认领锁。多 agent 协作（如 subagent 团队）时，agent 认领任务会写入 lease 文件，防止两个 agent 同时处理同一任务；任务完成后锁释放
+
+**使用示例：**
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787211404894-77b1d23f-3e02-45f9-85ef-14b50a9c82d4.png" width="1068" title="" crop="0,0,1,1" id="jIcfR" class="ne-image">
+
+任务 json 长这样：
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787211654061-4610efbf-8dd3-423c-b1fa-f832dc756881.png" width="1600" title="" crop="0,0,1,1" id="B2WHj" class="ne-image">
 
 ---
