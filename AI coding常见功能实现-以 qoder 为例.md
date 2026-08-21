@@ -1,6 +1,6 @@
 > 本文是《Claude Code 实现原理拆解：一个 Agent Harness 的 20 层结构》的姊妹篇。原理篇讲的是"这类编程 Agent 内部怎么运转"，本文讲的是"这些机制落到日常使用的 AI 编程工具上，对应什么功能、怎么用"，以 Qoder 为例逐一对应。
 >
-> **阅读方式**：全文 20 个小节，与原理篇的 20 个章节一一对应。每节先一句话说明原理篇对应章节在解决什么问题，再介绍 Qoder 中的对应功能、触发或配置方式，并给出官方文档链接。
+> **阅读方式**：全文与原理篇的 20 个机制逐一对应（其中 15–17 在 Qoder 侧对应同一个功能，合并为一节，正文共 18 节）。每节先一句话说明原理篇对应章节在解决什么问题，再介绍 Qoder 中的对应功能、触发或配置方式，并给出官方文档链接。
 >
 > **说明**：（1）Qoder 产品迭代较快，文中命令、默认值与行为以撰写时版本为准，落地前建议对照官方文档确认。（2）截图基于撰写时的实际使用环境，界面可能随版本变化。
 >
@@ -22,11 +22,9 @@
 | 10 | System Prompt | 上下文自动组装 | 规则、记忆、Skill 在运行时分层注入 |
 | 11 | Error Recovery | 错误自愈 | 失败信息回灌自动重试 + 检查点恢复 |
 | 12 | Task System | 任务系统 | TaskCreate 等 4 个内置工具管理任务图，带状态与依赖 |
-| 13 | Background Tasks | 后台执行 | 慢命令丢后台、后台子代理 |
-| 14 | Cron Scheduler | 定时任务 | 自然语言创建，cron 表达式触发 |
-| 15 | Agent Teams | 多智能体协作 | Agent Teams（beta） |
-| 16 | Team Protocols | （并入 15） | 通信机制内置于协作能力中 |
-| 17 | Autonomous Agents | Quest 自主任务 | 设定目标后自主执行到达成 |
+| 13 | Background Tasks | 后台执行 | 慢命令丢后台、后台子代理，`/tasks` 查看 |
+| 14 | Cron Scheduler | 定时与循环执行 | 自然语言触发 `/loop` Skill → CronCreate 建任务 |
+| 15–17 | Agent Teams / Team Protocols / Autonomous Agents | Agent Teams（beta） | main Agent + teammate、SendMessage 通信、shared Task 自主认领；附单 Agent 的 `/goal` |
 | 18 | Worktree Isolation | Worktree 并行 | 一任务一 worktree，改动互不覆盖 |
 | 19 | MCP Plugin | MCP 与插件 | 外部工具接入同一工具池，插件打包分发 |
 | 20 | 综合架构 | 全景：机制归一个循环 | CLI 与 IDE 各能力如何协同 |
@@ -591,5 +589,190 @@ pending → in_progress → completed。
 任务 json 长这样：
 
 <img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787211654061-4610efbf-8dd3-423c-b1fa-f832dc756881.png" width="1600" title="" crop="0,0,1,1" id="B2WHj" class="ne-image">
+
+---
+## 13 Background Tasks：慢操作丢后台
+> 原理篇第 13 节：`npm install` 跑三分钟，同步等待会让 Agent 白白闲着；判断是慢操作就丢后台线程，完成后把结果作为通知注入下一轮。
+>
+
+Qoder 侧有三种后台执行形态：
+
+| 形态 | 说明 |
+| --- | --- |
+| 后台命令 | 长时间运行的命令（安装依赖、构建、启动服务、跟踪日志）放到后台执行，主对话继续往下做 |
+| 后台 Subagent | 启用后台 Subagent 能力时，把独立子任务放到后台跑，完成后再通知主会话（见第 06 节） |
+| 动态工作流 | `/workflows` 编排的多 Agent 流程始终作为后台任务运行，启动后返回运行 ID |
+
+
+**怎么用**：
+
++ 直接说明意图即可，例如"在后台运行 pip3 list 命令，并查找当前目录下的所有 Python 文件。"——它会把命令丢后台并立刻继续干活；
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787214610227-aa9b0b53-5348-400b-bc45-78f86d9d9cbf.png" width="1134" title="" crop="0,0,1,1" id="CYxWq" class="ne-image">
+
++ 当任务明显大于一次 Agent 调用时，可以使用动态工作流：仓库审计、深度研究、迁移规划、发版检查、跨文件扫描，或需要多个独立视角后再汇总的评审流程。（动态工作流会把编排计划放到一段 JavaScript 脚本里。脚本决定启动哪些子 Agent、如何划分阶段、如何合并中间结果，以及最终把什么结果返回到当前会话。）
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787214986020-e4963e6e-50b0-445a-8d04-3d2816b9b326.png" width="1494" title="" crop="0,0,1,1" id="iRAhB" class="ne-image">
+
++ `/tasks` 打开后台任务面板，查看当前正在运行的后台任务及其状态；
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787215073416-d64b1578-eb17-4813-bd4f-90bdea303e2f.png" width="1524" title="" crop="0,0,1,1" id="Ci7q6" class="ne-image">
+
++ 你可以在当前会话中继续对话。当后台任务完成后，结果会作为通知注入下一轮对话，模型在同一轮里同时看到"当轮工具结果"和"后台完成通知"，可以综合决策。
+
+**官方文档**：[https://docs.qoder.com/zh/cli/workflows](https://docs.qoder.com/zh/cli/workflows)
+
+---
+
+## 14 Cron Scheduler：定时与循环执行
+> 原理篇第 14 节：需要一个不依赖人推的触发源——调度器只管"到点没"，队列处理器只管"Agent 空不空"，四层解耦。
+>
+
+创建方式很简单——**直接用自然语言描述时间和要做的事**即可：
+
+```plain
+每 2min 打印一下当前时间
+每天早上 9 点检查一次 CI 状态并汇总
+每周一上午 10 点生成上周的提交摘要
+```
+
+实测下的完整链路：自然语言描述周期性任务时，模型会**自动触发内置的 **`/loop`** Skill**，再由它调用 `CronCreate` 工具把描述转成 cron 表达式建任务：
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787224950840-77f22f43-2f1c-48e5-81bf-657085b7bca7.png" width="1620" title="" crop="0,0,1,1" id="kWxgk" class="ne-image">
+
+创建成功后会直接告诉你任务 ID、cron 表达式、生效范围与过期时间，且**不等第一个周期、当场先跑一次**。取消用 `CronDelete`（直接说"列出所有定时任务"、"删除定时任务 "即可）。
+
+### 生效范围与限制
+**默认仅当前会话有效，进程退出即失效**——关了终端，定时任务就不存在了。需要跨会话保留要显式要求落盘（`/loop` 的 `--durable`），写入 `<project>/.qoder/scheduled_tasks.json`。
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787226728333-afa62a35-0594-4966-b8e6-04939b55bd33.png" width="1116" title="" crop="0,0,1,1" id="DYhMp" class="ne-image"><img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787226551619-26e07b10-cb7b-411e-a028-78f174988cde.png" width="1136" title="" crop="0,0,1,1" id="gIHBH" class="ne-image">
+
+三条必须知道的限制：
+
++ 任务数量上限 **50 个**；
++ 周期任务创建后 **7 天自动过期**——需要长期跑就得重建，否则会悄无声息地失效；
++ 最小粒度 **1 分钟**，且触发时间带抖动（周期任务最多后延 15 分钟，避免大量任务集中触发），别用它做要求精确到秒的事。
+
+### 显式用 /loop
+想精确控制间隔与预算时，直接调 `/loop`：
+
+```plain
+/loop 5m check the deploy
+/loop 10m --max-turns 6 check the deploy    # 跑满 6 次后停止
+/loop 30m --durable check the deploy       # 落盘，重启后仍在且不自动过期
+/loop monitor CI pipeline                 # 不给间隔，由 Qoder 自行决定节奏（60s–3600s）
+```
+
+两个防超支的上限值得默认加上：`--max-turns N`（跑满 N 次停止）、`--max-credits N`（累计消耗 N 积分停止），两者先到者停止；轮次按任务整个生命周期累计，重启 CLI 不会清零。`/crontab` 可以打开定时任务面板查看每个循环的用量。
+
+**官方文档**：
+
++ 定时执行任务：[https://docs.qoder.com/zh/cli/scheduled-tasks](https://docs.qoder.com/zh/cli/scheduled-tasks)
++ 重复执行任务：[https://docs.qoder.com/zh/cli/loop](https://docs.qoder.com/zh/cli/loop)
+
+---
+
+## 15–17 Agent Teams：多智能体协作与自主执行
+> 原理篇第 15–17 节：子 Agent 是一次性的、用完即销毁，大项目需要"派出去以后还能继续对话"的持久队友（15）；异步通信需要请求-响应约定，否则消息发出去没人管（16）；任务不用逐个分配，Agent 自己从看板认领、持续推进（17）。
+>
+> 这三层机制在 Qoder 侧对应的是**同一个功能** —— Agent Teams：持久队友、SendMessage 通信、shared Task 自主认领。
+>
+
+Agent Teams 让一个交互式会话变成小型 Agent 团队。交互入口不变——你还是在当前会话里描述目标，main Agent 根据需要创建 teammate，让不同成员并行研究、实现、验证或互相交接。
+
+> **Beta**：当前默认不启用，启动前需打开环境变量开关，执行命令启动 `QODER_AGENT_TEAMS=1 qoder`；也可写入 `~/.qoder/.env` 让后续启动自动启用（改后需重启）。
+>
+
+### 两个角色
+| 角色 | 职责 |
+| --- | --- |
+| main Agent | 你直接对话的 Agent：理解目标、拆分任务、汇总结果、报告进展 |
+| teammate | main Agent 创建的成员（如 researcher、coder、reviewer），有自己的上下文，可持续接收 Task 和 SendMessage |
+
+
+### 怎么用
+不需要手动建团队，但**最稳定的方式是在请求里明确说“使用 Agent Teams”**并给出分工——只说"并行处理"或"几个agent处理一下"，Qoder 可能会选择普通 Subagent、background task 或 Workflow：
+
+```plain
+使用 Agent Teams 处理这个重构。
+创建 researcher、coder、reviewer 三个 teammate：
+1. researcher 先梳理认证模块的调用链。
+2. coder 根据 researcher 的结论修改代码。
+3. reviewer 复核改动风险和缺失测试。
+最终请给出改动摘要、涉及文件和验证结果。
+```
+
+TUI 中在会话底部可以看到 agents 列表，按向下键进入后用上下键选择 main conversation 或某个 teammate，回车切换视图、Esc 返回。
+
+### 协作约定：SendMessage 与 shared Task
+这套约定内置在 Agent Teams 里，用户不需要自己实现，但理解它有助于把任务描述写对。
+
+**SendMessage（成员间通信）**：main Agent 与 teammate、teammate 与 teammate 之间靠它沟通问题、发现和结果。关键一点：**teammate 的普通文本输出不会自动广播给其他成员**——需要传给特定成员的信息才通过 SendMessage 走。界面上通常显示为 `Message from @researcher` 这样的提示。
+
+**shared Task list（自主认领）**：记录谁在做什么、进展如何、哪些任务依赖其他任务——正是第 12 节任务工具的 `owner` / `status` / `blockedBy` 字段在多 Agent 场景下的用途，任务锁（`.task-locks/<id>.lease`）也是为此存在，防止两个成员认领同一任务。
+
+```plain
+shared Task list
+├── [in progress] 梳理旧接口调用点   owner=@researcher
+├── [pending]     实现新接口适配     owner=@coder
+└── [pending]     补充迁移测试       owner=@tester
+```
+
+任务完成不等于 teammate 退出——成员完成后仍留在团队中等下一步。任务超过两三步时，明确要求它建 shared Task，协作状态会清楚很多：
+
+```plain
+使用 Agent Teams 和 shared Task list 推进这个迁移。
+先创建以下 Task：1. 梳理旧接口调用点 2. 实现新接口适配 3. 补充迁移测试
+然后创建 researcher、coder、tester 三个 teammate 分别领取 Task。
+请在最终结果里说明每个 Task 的完成情况、关键改动和验证结果。
+```
+
+### 生命周期（重要）
+**团队只存在于当前 TUI 会话**。teammate 在同一次 TUI 中可以反复 `running → idle → running`，`idle` 只表示暂时没活干、不代表退出。退出 TUI 时 teammate 会被结束、团队状态被清理；之后 `resume` 只恢复主会话历史，**teammate 不会一起回来**，需要让 main Agent 重新创建。
+
+### 使用案例
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787290919373-724bdeed-9b6b-4f6e-8298-76dd6063cf3f.png" width="1404" title="" crop="0,0,1,1" id="kGCe8" class="ne-image"><img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787291057554-e9e270c2-ab4e-4d53-b6fd-34052f9ad11a.png" width="1752" title="" crop="0,0,1,1" id="e6T9E" class="ne-image"><img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787291372540-89091c68-1112-4160-8841-5956d4453cb7.png" width="1836" title="" crop="0,0,1,1" id="PgLdy" class="ne-image"><img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787291602021-1698e0ae-9519-4f87-8920-57283db214ab.png" width="1622" title="" crop="0,0,1,1" id="mUKHY" class="ne-image"><img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787291754150-a8165cc2-d666-46f6-9ba9-52528f1d83cd.png" width="1500" title="" crop="0,0,1,1" id="UKnYS" class="ne-image">
+
+### 与 Subagent 的区别
+| 对比项 | Subagent | Agent Teams |
+| --- | --- | --- |
+| 适合任务 | 单个聚焦子任务 | 多成员持续协作的复杂任务 |
+| 生命周期 | 完成一次任务即返回结果 | teammate 可 idle，在同一会话里继续接活 |
+| 通信方式 | 结果主要返回给 main Agent | 成员之间可通过 SendMessage 互相沟通 |
+| 成员身份 | 以 Subagent 类型为主 | 以运行时名字为主，如 `@coder`、`@reviewer` |
+
+
+**控制并发规模**：同时开太多 teammate 会显著增加 token 与信息合并成本，多数场景从 2–4 个就行。
+
+### 补充：自主执行：Goal
+Agent Teams 是多 Agent 版的自主协作；如果只是想让 **Qoder 持续跑到目标达成**，用 `/goal` 更轻。给一个明确的完成条件，它会把目标拆成步骤持续执行，尽量不中途打扰——适合"把测试全部修绿""重构到构建通过"这类有清晰终点的任务：
+
+```plain
+/goal 修复所有失败的单元测试，直到 npm test 全部通过
+/goal 重构支付模块并保证测试通过 --turns 30
+```
+
+| 命令 | 作用 |
+| --- | --- |
+| `/goal <描述> [--turns <n>]` | 创建或更新目标，`--turns` 限制最大轮数 |
+| `/goal status` | 查看状态：Active / Paused、已用轮数、耗时 |
+| `/goal pause` / `/goal resume` | 暂停 / 恢复 |
+| `/goal take` | 目标由其他会话持有时，接管所有权 |
+| `/goal clear` | 清除目标（判定达成时会自动清除） |
+
+
+使用的时候需要知道：
+
++ **Goal 不改变权限模式**：执行期间的工具授权仍按当前权限模式走。想真正无人值守，得先自行切到 `auto` 或 `yolo`——否则它会停在确认弹窗上（第 03 节提到：非交互下 `ask` 等于拒绝）；
++ **目标跨会话持久化**：由另一个会话创建的目标，当前会话默认不能直接更新，需要 `/goal take` 认领。
+
+配合 `/plan` 更可控：先只读分析、确认方案，再进 Goal 让它自主执行到完成。IDE 侧的 Quest 是同一理念的图形化形态——"Define the goal. Review the result."，描述目标后 Agent 自主执行，执行完在审查面板看 Diff 后直接提交。
+
+**官方文档**：
+
++ Agent Teams：[https://docs.qoder.com/zh/cli/agent-teams](https://docs.qoder.com/zh/cli/agent-teams)
++ 持续完成目标（Goal）：[https://docs.qoder.com/zh/cli/goal](https://docs.qoder.com/zh/cli/goal)
++ 先规划再执行（Plan）：[https://docs.qoder.com/zh/cli/plan-mode](https://docs.qoder.com/zh/cli/plan-mode)
++ Quest 概览：[https://docs.qoder.com/zh/user-guide/quest/overview](https://docs.qoder.com/zh/user-guide/quest/overview)
 
 ---
