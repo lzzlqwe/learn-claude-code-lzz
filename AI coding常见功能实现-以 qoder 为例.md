@@ -1,6 +1,6 @@
 > 本文是《Claude Code 实现原理拆解：一个 Agent Harness 的 20 层结构》的姊妹篇。原理篇讲的是"这类编程 Agent 内部怎么运转"，本文讲的是"这些机制落到日常使用的 AI 编程工具上，对应什么功能、怎么用"，以 Qoder 为例逐一对应。
 >
-> **阅读方式**：全文与原理篇的 20 个机制逐一对应（其中 15–17 在 Qoder 侧对应同一个功能，合并为一节，正文共 18 节）。每节先一句话说明原理篇对应章节在解决什么问题，再介绍 Qoder 中的对应功能、触发或配置方式，并给出官方文档链接。
+> **阅读方式**：全文与原理篇的 20 个机制逐一对应（其中 15–17 在 Qoder 侧对应同一个功能，合并为一节，正文共 18 节）。每节先一句话说明原理篇对应章节在解决什么问题，再介绍 Qoder 中的对应功能、触发或配置方式，并给出官方文档链接。最后一节把所有能力按职责归位，并给出一张按症状查的排查索引。
 >
 > **说明**：（1）Qoder 产品迭代较快，文中命令、默认值与行为以撰写时版本为准，落地前建议对照官方文档确认。（2）截图基于撰写时的实际使用环境，界面可能随版本变化。
 >
@@ -25,9 +25,9 @@
 | 13 | Background Tasks | 后台执行 | 慢命令丢后台、后台子代理，`/tasks` 查看 |
 | 14 | Cron Scheduler | 定时与循环执行 | 自然语言触发 `/loop` Skill → CronCreate 建任务 |
 | 15–17 | Agent Teams / Team Protocols / Autonomous Agents | Agent Teams（beta） | main Agent + teammate、SendMessage 通信、shared Task 自主认领；附单 Agent 的 `/goal` |
-| 18 | Worktree Isolation | Worktree 并行 | 一任务一 worktree，改动互不覆盖 |
+| 18 | Worktree Isolation | Worktree 并行 | 一任务一 worktree，独立检出与临时分支 |
 | 19 | MCP Plugin | MCP 与插件 | 外部工具接入同一工具池，插件打包分发 |
-| 20 | 综合架构 | 全景：机制归一个循环 | CLI 与 IDE 各能力如何协同 |
+| 20 | 综合架构 | 全景：Harness 很多，循环一个 | 能力分层归位 + 按症状定位缺哪一层的排查索引 |
 
 
 ---
@@ -776,3 +776,182 @@ Agent Teams 是多 Agent 版的自主协作；如果只是想让 **Qoder 持续�
 + Quest 概览：[https://docs.qoder.com/zh/user-guide/quest/overview](https://docs.qoder.com/zh/user-guide/quest/overview)
 
 ---
+## 18 Worktree Isolation：多任务并行不互相覆盖
+> 原理篇第 18 节：任务管目标，worktree 管目录——使得两个 Agent 同时改代码不干扰。
+>
+
+同时推进两个任务时，共享一个工作目录必然互相覆盖。Qoder 用 Git worktree 做隔离：每个任务一个独立检出、一条独立临时分支。
+
+### 启动方式
+```bash
+qoder --worktree feature-a
+qoder --worktree feature-a "实现登录修复"
+qoder --worktree                      # 不传名称则自动生成
+```
+
+几个要点：
+
++ 命名 worktree 放在 `<repo>/.qoder/worktrees/<处理后的名称>`，并创建名为 `worktree-<处理后的名称>` 的临时分支；
++ **同名已存在时直接复用**，不会重复创建；
++ 前提：在 Git 仓库中运行且本地已安装 Git；
++ 新 worktree 优先基于 `origin/HEAD` 指向的默认分支创建；要从最新远端提交开始，先 `git fetch origin`。
+
+### 双终端并行
+```bash
+# 终端 1：处理任务 A
+qoder --worktree feature-a "实现登录修复"
+
+# 终端 2：处理任务 B
+qoder --worktree feature-b "重构日志模块"
+```
+
+两个会话各有自己的工作树和分支，改动彼此隔离，完成后分别提交或合并。
+
+### 退出与清理
+会话结束时会打印 worktree 路径和恢复命令（`cd <worktree-path> && qoder --resume <session-id>`）。交互式退出会检查未提交文件与新增提交：干净的可以自动删除，有内容时让你选择保留还是删除。
+
+### 另外两种用法
++ **子代理隔离**：Markdown 子代理定义中加 `isolation: worktree`，让它在独立检出里改文件（见第 06 节）。干净的子代理 worktree 结束后自动删除，有改动的保留；
++ **批量改动**：内置 `/batch` Skill 会在隔离的 worktree 中生成并行工作代理，跨多文件应用批量改动（需当前目录是 git 仓库）。
+
+**官方使用建议**：一任务一 worktree，别在一个里面塞多件事；用完及时清理，否则仓库里会堆一堆临时分支。
+
+**官方文档**：
+
++ 并行处理任务：[https://docs.qoder.com/zh/cli/parallel-tasks](https://docs.qoder.com/zh/cli/parallel-tasks)
++ 运行任务（worktree 完整说明）：[https://docs.qoder.com/zh/cli/run-tasks](https://docs.qoder.com/zh/cli/run-tasks)
+
+---
+
+## 19 MCP Plugin：接外部工具，打包分发能力
+> 原理篇第 19 节：把外部工具接进同一个工具池——不改循环、不改工具分发逻辑，模型看到的只是"多了几个工具"。
+>
+
+这一节对应 Qoder 的两个机制：**MCP** 负责把外部系统的工具接进来，**插件** 负责把配好的能力打包分发给团队。
+
+### MCP：接入外部工具
+添加一个 stdio MCP 服务（MCP Server 运行在本地），`--` 后面是 Qoder 需要启动的服务进程：
+
+```bash
+qoder mcp add playwright -- npx -y @playwright/mcp@latest
+```
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787384873141-e8e67f70-9983-45c8-a314-3f6952951711.png" width="1618" title="" crop="0,0,1,1" id="n6rtE" class="ne-image">
+
+添加一个 HTTP MCP 服务（MCP Server 运行在云端服务器），`--` 后面是 Qoder 需要启动的服务进程：
+
+```bash
+qoder mcp add yuque -t http -- npx mcp-remote https://mcp.alibaba-inc.com/yuque/mcp 
+```
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787385857017-a3b67f54-7bc5-4998-8231-c855186c65aa.png" width="1778" title="" crop="0,0,1,1" id="Uf59k" class="ne-image">
+
+常用管理命令：
+
+| 命令 | 作用 |
+| --- | --- |
+| `qoder mcp list` | 列出已配置的服务 |
+| `qoder mcp remove <name>` | 移除服务 |
+| `/mcp reload` | CLI 运行中重新发现服务与工具（新会话启动时自动发现） |
+
+
+**传输类型**用 `-t` 指定：`stdio`（本地命令，默认）、`sse`、`http`、`ws`。**作用域**用 `-s` 指定，决定配置写到哪：
+
+| 作用域 | 写入位置 | 适用场景 |
+| --- | --- | --- |
+| `user` | `~/.qoder/settings.json`   `~/.qoder/.mcp.json` | 当前账号所有项目可用 |
+| `local`（默认） | `${project}/.qoder/settings.local.json` | 只在本机当前项目可用 |
+| `project` | `${project}/.mcp.json` | 随项目共享给团队 |
+
+
+**关键点：MCP 工具走同一套权限系统**（看第 03 节）。工具名格式为 `mcp__<server>__<tool>`，可以按服务批量放行：
+
+```json
+{
+  "permissions": {
+    "allow": ["mcp__context7__*"],
+    "deny": []
+  }
+}
+```
+
+### 插件：把能力打包分发
+插件把命令、子代理、Skill、Hook、MCP server 打包成一个目录，安装后自动被发现和加载——**前面各节配好的东西，都可以通过插件一次性分发给团队**：
+
+```plain
+my-plugin/
+├── .qoder-plugin/
+│   └── plugin.json        # manifest，至少含 name
+├── commands/              # 自定义斜杠命令
+├── agents/                # 子代理（见第 06 节）
+├── skills/                # Skill（见第 07 节）
+├── hooks/
+│   └── hooks.json         # Hook 配置（见第 04 节）
+└── .mcp.json              # 附带的 MCP server 声明
+```
+
+约定目录**有则加载、无则忽略**。安装与管理：
+
+```bash
+qoder plugins install ~/my-plugin              # 从本地目录安装
+qoder plugins install ~/my-plugin -s project   # 装到项目级，可提交共享
+qoder plugins list                             # 列出已安装
+qoder plugins validate ~/my-plugin             # 开发期校验目录结构
+qoder plugins enable/disable my-plugin         # 启用 / 禁用
+```
+
+安装后重启 CLI 或执行 `/plugins reload` 生效。作用域同样分 `user`（默认，全局）/ `project`（团队共享）/ `local`（本机实验）。
+
+一个容易踩的差异：**插件的 **`hooks/hooks.json`** 需要外层多一层 **`{ "hooks": ... }`** 包裹**，而 `settings.json` 里直接写 `hooks` 字段。插件 Hook 执行时还会拿到 `QODER_PLUGIN_ROOT`（安装根目录）和 `QODER_PLUGIN_DATA`（数据目录，跨升级保留状态）两个环境变量。
+
+### 插件市场
+市场是插件的集中分发源，支持 Git 仓库、`owner/repo` 简写、本地目录、指向 `marketplace.json` 的 URL：
+
+```bash
+qoder plugins marketplace add org/my-marketplace
+qoder plugins marketplace list
+qoder plugins install hello-world              # 添加市场后直接按名字装
+qoder plugins list --available --json          # 看市场里还有什么可装
+```
+
+<img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/187156762/1787388007031-4c16e82b-2322-4e7b-ad36-92601adcfa8f.png" width="1454" title="" crop="0,0,1,1" id="wS8Wx" class="ne-image">
+
+会话内用 `/plugins` 管理插件、`/marketplace` 浏览市场。集团内部同学还可以在 **Aone 开放平台**（[https://open.aone.alibaba-inc.com/market](https://open.aone.alibaba-inc.com/market)，内网）获取现成的 Skill、MCP 与工具资源。
+
+**官方文档**：
+
++ MCP 服务：[https://docs.qoder.com/zh/cli/mcp-servers](https://docs.qoder.com/zh/cli/mcp-servers)
++ 插件：[https://docs.qoder.com/zh/cli/plugins](https://docs.qoder.com/zh/cli/plugins)
+
+---
+
+## 20 综合架构：Harness 很多，循环一个
+> 原理篇第 20 节：前面 19 层机制，最终都挂在同一个 agent loop 上——没有第二个循环。
+>
+
+**Agent = Model + Harness**。模型的能力来自训练，Qoder 提供的是那层 harness。把前面 17 节的功能按职责整理一下，就大概清楚了：
+
+| 层次 | Qoder 提供的能力 | 对应小节 |
+| --- | --- | --- |
+| 循环本身 | Agent 交互模式（自然语言驱动，模型决定何时结束） | 01 |
+| 能动手 | 内置工具集、权限三档、Hooks 注入点 | 02 / 03 / 04 |
+| 能做复杂任务 | 待办列表、子代理、Skills、上下文压缩 | 05 / 06 / 07 / 08 |
+| 能记住和恢复 | AGENTS.md 与规则、上下文运行时组装、错误自愈 | 09 / 10 / 11 |
+| 能长期运行 | 任务工具、后台执行、定时与循环 | 12 / 13 / 14 |
+| 能协作 | Agent Teams、Goal、Worktree 隔离 | 15–17 / 18 |
+| 能扩展 | MCP 接入、插件打包分发 | 19 |
+
+
+**这些机制没有各自的循环**。工具调用、Skill 加载、子代理派生、上下文压缩、后台通知注入、定时任务触发，最终都收敛到同一条主循环里：模型决策 → 执行 → 结果回灌 → 模型再决策。理解这一点的实际价值在于——**出问题时知道该往哪一层改，例如**：
+
+| 症状 | 通常缺的是哪一层 |
+| --- | --- |
+| 反复交代同样的项目约定 | 记忆层（09）：AGENTS.md 与规则没写 |
+| 担心它误跑危险命令 | 权限层（03）+ Hooks（04）：闸门没配 |
+| 长任务跑到一半失忆 | 上下文层（08）：该压缩、该写 HANDOFF.md 交接 |
+| 多任务改动互相覆盖 | 隔离层（18）：没用 worktree |
+| 让它自动跑却"什么都没做" | 权限层（03）：非交互下 `ask` 等于拒绝 |
+| 缺少访问外部系统的能力 | 扩展层（19）：MCP 没接 |
+
+
+**官方文档总入口**：[https://docs.qoder.com/zh/product-series/what-is-qoder](https://docs.qoder.com/zh/product-series/what-is-qoder)
