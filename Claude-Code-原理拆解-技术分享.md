@@ -2,9 +2,11 @@
 
 > 日常使用 Claude Code 或其他 AI 编程工具写代码时，很容易对它内部怎么运转产生兴趣——为什么能连续跑几十轮不跑偏、上下文满了之后发生了什么、多个 Agent 并行改代码为什么不互相覆盖。为此我花了一段时间把这类编程 Agent 的实现机制梳理了一遍并记录下来，方便日常工作中使用和搭建 Agent。
 >
-> 全文按 20 个机制层次组织，每一节的结构是：**这一层解决什么问题 → 怎么实现（含关键代码）→ 要点与取舍（含与真实实现的差距）**。
+> 本文基于开源项目 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 整理，想跑代码、看完整实现可直接去仓库。AI 迭代很快，仓库后续更新可能与本文对不上。
 >
-> 说明：（1）文中代码是为说明原理而写的最小化复现（Python），不是 Claude Code 源码。真实实现的复杂度在每一节末尾单独说明。（2）借助 AI 对文章表述进行了润色。
+> 全文按 20 个机制层次组织，每一节的结构是：**这一层解决什么问题 → 怎么实现 → 要点与取舍**。
+>
+> 说明：（1）文中代码不是 Claude Code 源码，而是为讲清原理写的**精简 Python**：只保留能说明机制的骨架行，错误分支、参数校验、锁维护这类样板逻辑一律用注释交代。目标是让你**扫一眼就知道这层挂在哪里、做了什么**，不需要逐行读。真实实现与最小实现的差距集中在文末一张表里。（2）借助 AI 对文章表述进行了润色。
 
 ---
 
@@ -73,7 +75,7 @@ Claude Code = 一个 agent loop
 | `messages` | 对话历史，`{role, content}` 列表 |
 | `block` | 模型返回的单个内容块，`block.name` / `block.input` / `block.id` 分别是内容块名、参数、调用 ID |
 
-为控制篇幅，与当前主线无关的函数体会省略，但会用注释标注它的输入输出和职责，不会出现没交代的调用。
+函数名前的注释就是它的实现说明。凡是用 `# 函数名(参数): 职责` 形式给出的，意思是“这个函数体对当前主线没信息量，知道它干什么就够了”——不会出现没交代过的调用。
 
 ---
 
@@ -137,8 +139,8 @@ def agent_loop(messages: list):
 ### 要点与取舍
 
 - **`stop_reason` 在流式响应下不完全可靠**。Claude Code 不直接看它，而是用 `needsFollowUp` 标志：只要检测到 `tool_use` 块就置 true。
-- **单工具带来不小代价**。只有 bash 时，模型读文件要拼 `cat file.py`，写文件要拼 heredoc（shell 里把多行文本当输入的写法，如 `cat > f <<EOF ... EOF`），既费 token 又容易转义出错。这是第 2 节要解决的。
-- **防止 Agent 执行危险操作**。最小实现里的 `run_bash` 有一个简单黑名单（`rm -rf /`、`sudo` 等）和超时截断，但那不是安全机制，只是防手滑。权限控制在第 3 节。
+- **单工具会带来不小代价**。只有 bash 工具时，模型读文件要拼 `cat file.py`，写文件要拼 heredoc（shell 里把多行文本当输入的写法，如 `cat > f <<EOF ... EOF`），既费 token 又容易转义出错。这是第 2 节要解决的问题。
+- **防止 Agent 执行危险操作**。最小实现里的 `run_bash` 有一个简单黑名单（`rm -rf /`、`sudo` 等）和超时截断，但那不是安全机制，只是防手滑。具体的权限控制在第 3 节。
 
 ---
 
@@ -189,7 +191,6 @@ output = handler(**block.input) if handler else f"Unknown: {block.name}"
 
 - **`input_schema` 是可靠性的来源**。让模型产出结构化参数，比让它产出一行需要正则解析的字符串稳定得多。工具描述写清楚，模型的调用准确率会明显不同。
 - **多工具调用的执行顺序**：最小实现按 `response.content` 的原始顺序逐个执行。Claude Code 会按连续块分批，batch 内并发安全的工具并行跑，batch 间严格串行——因为 `read_file` 之间无所谓顺序，但 `write_file` 和后续的 `read_file` 顺序反了结果就错了。这需要一个并发安全判定加分区算法。
-- 生产实现还有 schema 校验、输入验证、流式工具执行等，为了主干清晰这里全部省略。
 
 ---
 
@@ -197,7 +198,7 @@ output = handler(**block.input) if handler else f"Unknown: {block.name}"
 
 ### 问题
 
-文件工具被 `safe_path` 管住了，但 bash 仍然不受限制。而且"要不要执行这条命令"是**策略问题**，不该写在 `run_bash` 里面——那会让工具函数同时承担"能不能做"和"该不该做"两件事。
+文件工具被 `safe_path` 管住了，但 bash 仍然不受限制。而且"要不要执行这条命令"是**策略问题**，不该写在 `run_bash` 里面——那会让工具函数同时承担"能不能做"和"该不该做"两件事，变得臃肿复杂。
 
 ### 实现
 
@@ -216,35 +217,22 @@ flowchart TD
 ```
 
 ```python
-# Gate 1 的硬黑名单：命令中含任一字串就无条件拒绝
-DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot",
-             "mkfs", "dd if=", "> /dev/sda", "format "]
+# Gate 1 的硬黑名单：bash 命令含任一字串就无条件拒绝，不问用户
+DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
 
-# Gate 2 的规则表：tools 限定适用工具，check 返回 True 表示命中，message 是提示给用户的理由
-PERMISSION_RULES = [
-    {"tools": ["write_file", "edit_file"],
-     "check": lambda args: not (WORKDIR / args.get("path", "")).resolve()
-                                .is_relative_to(WORKDIR),
-     "message": "Writing outside workspace"},
-    {"tools": ["bash"],
-     "check": lambda args: any(kw in args.get("command", "")
-                               for kw in ["rm ", "> /etc/", "chmod 777"]),
-     "message": "Potentially destructive command"},
-]
+# Gate 2 的规则表。每条 = {tools: 适用工具, check: 命中判定, message: 给用户看的理由}
+#   ① write_file / edit_file：path resolve 后落在 WORKDIR 外 → "Writing outside workspace"
+#   ② bash：命令含 "rm " / "> /etc/" / "chmod 777" → "Potentially destructive command"
+PERMISSION_RULES = [...]
 
-# 三个辅助函数都是几行遍历，此处只给签名：
-#   check_deny_list(command)      -> 命中 DENY_LIST 返回拒绝原因字符串，否则 None
-#   check_rules(tool_name, args)  -> 命中 PERMISSION_RULES 返回该规则的 message，否则 None
-#   ask_user(tool_name, args, reason) -> 终端打印警告并读一行输入，返回 "allow" / "deny"
+# check_deny_list(command) / check_rules(tool, args): 几行遍历，命中返回原因字符串否则 None
+# ask_user(tool, args, reason): 终端打印警告并读一行输入，返回 "allow" / "deny"
 def check_permission(block) -> bool:
-    if block.name == "bash":                      # Gate 1: 硬黑名单，不问用户
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            return False
-    reason = check_rules(block.name, block.input)  # Gate 2: 规则匹配
-    if reason:
-        if ask_user(block.name, block.input, reason) == "deny":  # Gate 3: 审批
-            return False
+    if block.name == "bash" and check_deny_list(block.input.get("command", "")):
+        return False                                      # Gate 1: 硬黑名单
+    reason = check_rules(block.name, block.input)          # Gate 2: 规则匹配
+    if reason:                                             # 命中才问用户
+        return ask_user(block.name, block.input, reason) == "allow"   # Gate 3: 审批
     return True
 ```
 
@@ -257,7 +245,7 @@ if not check_permission(block):
     continue
 ```
 
-这一点很重要：模型看到"权限被拒"这条结果后，会自己换一条路走。如果直接抛异常中断循环，Agent 就死了。
+这一点很重要：模型看到"权限被拒"这条结果后，会自己换一条路走。如果直接抛异常中断循环，Agent 就中断了。
 
 ### 要点与取舍
 
@@ -305,17 +293,11 @@ def trigger_hooks(event: str, *args):
 第 3 节的权限逻辑原封不动搬进一个回调，权限从此只是众多 `PreToolUse` hook 中的一个：
 
 ```python
-# 五个回调的职责（实现略）：
-#   context_inject_hook(query)      向用户输入里补当前目录、分支等环境信息
-#   permission_hook(block)          就是第 3 节的 check_permission，被拒返回原因字符串
-#   log_hook(block)                 打印即将执行的工具名与参数，返回 None 不拦
-#   large_output_hook(block, out)   输出过大时告警，返回 None 不拦
-#   summary_hook(messages)          退出前统计本次会话的工具调用次数
-register_hook("UserPromptSubmit", context_inject_hook)
-register_hook("PreToolUse", permission_hook)
-register_hook("PreToolUse", log_hook)
-register_hook("PostToolUse", large_output_hook)
-register_hook("Stop", summary_hook)
+register_hook("UserPromptSubmit", context_inject_hook)  # 补当前目录、分支等环境信息
+register_hook("PreToolUse", permission_hook)            # 第 3 节的 check_permission 原样搬进来
+register_hook("PreToolUse", log_hook)                   # 打印工具名与参数，返回 None 不拦
+register_hook("PostToolUse", large_output_hook)         # 输出过大时告警，返回 None 不拦
+register_hook("Stop", summary_hook)                     # 退出前统计工具调用次数
 ```
 
 `Stop` hook 有个巧妙用法——它返回非 `None` 时，循环不退出，而是把返回值当成一条用户消息注入再 `continue`：
@@ -351,15 +333,10 @@ Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一�
 CURRENT_TODOS: list[dict] = []     # 进程内存，退出即丢
 
 def run_todo_write(todos: list) -> str:
-    global CURRENT_TODOS
-    for i, t in enumerate(todos):
-        if "content" not in t or "status" not in t:
-            return f"Error: todos[{i}] missing 'content' or 'status'"
-        if t["status"] not in ("pending", "in_progress", "completed"):
-            return f"Error: todos[{i}] has invalid status '{t['status']}'"
-    CURRENT_TODOS = todos
-    # ... 打印当前任务列表 ...
-    return f"Updated {len(CURRENT_TODOS)} tasks"
+    # 逐项校验：content / status 字段齐全，且 status ∈ {pending, in_progress, completed}，
+    # 不合法就返回 "Error: todos[i] ..." 让模型自己改——校验失败也是一条正常的工具结果
+    CURRENT_TODOS[:] = todos
+    return f"Updated {len(todos)} tasks"
 ```
 
 再配一个 nag 机制（周期性提醒）：连续 3 轮没调用 `todo_write`，就往消息流里塞一条提醒。
@@ -367,23 +344,10 @@ def run_todo_write(todos: list) -> str:
 ```python
 rounds_since_todo = 0              # 计数器：连续多少轮没更新 todo
 
-def agent_loop(messages: list):
-    global rounds_since_todo
-    while True:
-        if rounds_since_todo >= 3 and messages:
-            messages.append({"role": "user",
-                             "content": "<reminder>Update your todos.</reminder>"})
-            rounds_since_todo = 0
-
-        # ... 调 LLM、判断 stop_reason（同第 1 节）...
-        rounds_since_todo += 1
-
-        for block in response.content:             # 遍历本轮工具调用
-            if block.type != "tool_use":
-                continue
-            # ... 执行工具、收集 tool_result ...
-            if block.name == "todo_write":         # 本轮更新过 todo 就清零
-                rounds_since_todo = 0
+# 挂进第 1 节的循环，只动两处：
+#   ① 每轮开头：rounds_since_todo >= 3 就往 messages 里塞一条
+#      {"role": "user", "content": "<reminder>Update your todos.</reminder>"}，然后归零
+#   ② 每轮执行工具时：调到 todo_write 就归零，否则轮末 +1
 ```
 
 ### 要点与取舍
@@ -410,35 +374,15 @@ def agent_loop(messages: list):
 #   SUB_TOOLS    只有 5 个基础工具（bash / read / write / edit / glob），没有 task
 #   SUB_HANDLERS SUB_TOOLS 对应的 handler 表，结构同第 2 节的 TOOL_HANDLERS
 def spawn_subagent(description: str) -> str:
-    messages = [{"role": "user", "content": description}]   # 干净上下文
+    messages = [{"role": "user", "content": description}]   # ① 干净上下文，不继承主对话
 
-    for _ in range(30):                                     # 安全上限 30 轮
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                blocked = trigger_hooks("PreToolUse", block)   # 权限照样过
-                if blocked:
-                    results.append({"type": "tool_result",
-                                    "tool_use_id": block.id, "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                trigger_hooks("PostToolUse", block, output)
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id, "content": output})
-        messages.append({"role": "user", "content": results})
+    # ② 跑的还是第 1 节那个循环，只换三样东西：SUB_SYSTEM / SUB_TOOLS / SUB_HANDLERS。
+    #    工具执行照样过 PreToolUse 与 PostToolUse hook；最多 30 轮兜底
+    run_tool_loop(messages, SUB_SYSTEM, SUB_TOOLS, SUB_HANDLERS, max_rounds=30)
 
-    # extract_text(content): 从内容块列表里拼出纯文本，忽略 tool_use 块
-    result = extract_text(messages[-1]["content"])   # 只要结论
-    # ... 为空时向前回溯找最后一条有文本的 assistant 消息 ...
-    return result
+    # ③ 只回传结论：extract_text 从最后一条消息拼纯文本，忽略 tool_use 块。
+    #    为空则向前回溯找最后一条有文本的 assistant 消息，仍没有就返回明确的失败信息
+    return extract_text(messages[-1]["content"])
 ```
 
 三个主要的设计点：
@@ -464,33 +408,22 @@ def spawn_subagent(description: str) -> str:
 两级加载。第一级把**目录**（名称 + 一行描述）注入 system prompt，第二级由 Agent 自己调 load_skill 工具拉**全文**。每个 skill 是一个 `SKILL.md` 文件，文件头用 `---` 包裹一段 YAML 元数据（frontmatter）写 `name` 和 `description`，下面是正文。
 
 ```python
-SKILLS_DIR = WORKDIR / "skills"     # 每个子目录一个 skill
+SKILLS_DIR = WORKDIR / "skills"        # 每个子目录一个 skill
 SKILL_REGISTRY: dict[str, dict] = {}   # name -> {name, description, content}
 
-# _parse_frontmatter(text) -> (meta 字典, 正文)；文件头不是 `---` 开头时返回 ({}, 全文)
-def _scan_skills():
-    """启动时扫描 skills/ 目录，解析每个 SKILL.md 并写入 SKILL_REGISTRY。"""
-    for d in sorted(SKILLS_DIR.iterdir()):
-        manifest = d / "SKILL.md"
-        if manifest.exists():
-            raw = manifest.read_text(encoding="utf-8")
-            meta, body = _parse_frontmatter(raw)
-            name = meta.get("name", d.name)              # 缺失则用目录名
-            desc = meta.get("description", body.split("\n")[0])   # 缺失则用正文首行
-            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+# _scan_skills(): 启动时遍历 skills/*/SKILL.md，用 _parse_frontmatter 拆出 (meta, 正文)，
+#   按 name（缺失则用目录名）写入 SKILL_REGISTRY；description 缺失则取正文首行
+# list_skills(): 把 SKILL_REGISTRY 拼成 "- **name**: description" 的多行文本
 
-# list_skills() 把 SKILL_REGISTRY 拼成 "- **name**: description" 的多行文本
-def build_system() -> str:
+def build_system() -> str:                     # Layer 1：只注入目录
     return (f"You are a coding agent at {WORKDIR}. "
             f"Skills available:\n{list_skills()}\n"
             "Use load_skill to get full details when needed.")
 
-def load_skill(name: str) -> str:
-    """按 name 加载完整 skill 内容。通过 SKILL_REGISTRY 安全查表，无路径遍历风险。"""
+def load_skill(name: str) -> str:              # Layer 2：按需拉全文
+    """只接受 name，通过 SKILL_REGISTRY 查表——name 从来不是路径，无路径遍历风险。"""
     skill = SKILL_REGISTRY.get(name)
-    if not skill:
-        return f"Skill not found: {name}"
-    return skill["content"]
+    return skill["content"] if skill else f"Skill not found: {name}"
 ```
 
 成本对比很直观：
@@ -531,47 +464,24 @@ flowchart TD
     RC -.-> CALL
 ```
 
+| 层 | 触发条件 | 做什么 | API |
+|---|---|---|---|
+| **L3** `tool_result_budget` | 最新一轮 tool_result 总量 > 200KB | 从最大的开始依次落盘到 `.tool_results/{tool_use_id}.txt`，上下文只留 `<persisted-output>` 里的路径 + 前 2000 字预览 | 0 |
+| **L1** `snip_compact` | 消息数 > 50 | 保留头 3 条 + 尾 47 条，中间换成一条 `[snipped N messages]` | 0 |
+| **L2** `micro_compact` | tool_result 数 > 3 | 除最近 3 个外，超 120 字的旧结果原地换成占位符 | 0 |
+| **L4** `compact_history` | 估算字符数 > 50K | 先 `write_transcript` 备份成 jsonl，再调 LLM 摘要，整个列表换成一条 `[Compacted]` 消息 | 1 次 |
+
+四层里只有 L2 值得看代码——它是**原地改 block**，不是重建消息列表：
+
 ```python
-CONTEXT_LIMIT = 50_000        # 估算字符数超过它就走 L4
-KEEP_RECENT = 3               # L2 保留最近几个 tool_result 的完整内容
-PERSIST_THRESHOLD = 30_000    # L3 单条输出超过它才值得落盘
+KEEP_RECENT = 3        # 保留最近几个 tool_result 的完整内容
 
-# L1: snipCompact —— 消息数超限时裁剪中间消息（0 API 调用）
-def snip_compact(messages, max_messages=50):
-    if len(messages) <= max_messages: return messages
-    keep_head, keep_tail = 3, max_messages - 3
-    snipped = len(messages) - keep_head - keep_tail
-    return (messages[:keep_head]
-            + [{"role": "user", "content": f"[snipped {snipped} messages]"}]
-            + messages[-keep_tail:])
-
-# L2: microCompact —— 旧 tool_result 换成占位符（0 API 调用）
-# collect_tool_results(messages) 扫全部消息，返回所有 tool_result 块（按时间先后）
+# collect_tool_results(messages): 扫全部消息，按时间先后返回所有 tool_result 块
 def micro_compact(messages):
-    tool_results = collect_tool_results(messages)
-    if len(tool_results) <= KEEP_RECENT: return messages
-    for _, _, block in tool_results[:-KEEP_RECENT]:      # 除最近 3 个之外全换
+    for _, _, block in collect_tool_results(messages)[:-KEEP_RECENT]:
         if len(block.get("content", "")) > 120:
             block["content"] = "[Earlier tool result compacted. Re-run if needed.]"
     return messages
-
-# L3: toolResultBudget —— 超大输出落盘，上下文只留引用 + 预览（0 API 调用）
-# tool_result_budget(messages) 算最新一轮 tool_result 的总字符数，超 200KB 就从最大的
-# 开始依次交给下面的 persist_large_output 落盘，直到降到预算以下
-def persist_large_output(tool_use_id, output):
-    if len(output) <= PERSIST_THRESHOLD: return output
-    path = TOOL_RESULTS_DIR / f"{tool_use_id}.txt"       # 写到 .tool_results/
-    if not path.exists(): path.write_text(output, encoding="utf-8")
-    return (f"<persisted-output>\nFull output: {path}\n"
-            f"Preview:\n{output[:2000]}\n</persisted-output>")
-
-# L4: autoCompact —— LLM 全文摘要（1 次 API 调用，最贵）
-# write_transcript(messages)  把完整对话写成 .transcripts/ 下的 jsonl 备份
-# summarize_history(messages) 调一次 LLM 生成摘要，prompt 见下方
-def compact_history(messages):
-    transcript_path = write_transcript(messages)
-    summary = summarize_history(messages)
-    return [{"role": "user", "content": f"[Compacted]\n\n{summary}"}]
 ```
 
 摘要 prompt 明确要求保留 5 类信息，这是"压缩后还能继续干活"的关键：
@@ -586,24 +496,16 @@ prompt = ("Summarize this coding-agent conversation so work can continue.\n"
 在循环里的调用顺序是 **L3 → L1 → L2**，然后才判断要不要上 L4：
 
 ```python
-# estimate_size(messages): 粗估 token 用量，直接数序列化后的字符数
-# reactive_compact(messages): 应急压缩，先备份再摘要，保留摘要 + 最近 5 条消息
-messages[:] = tool_result_budget(messages)    # L3: 大结果落盘
+CONTEXT_LIMIT = 50_000                        # estimate_size: 数序列化后的字符数
+
+messages[:] = tool_result_budget(messages)    # L3: 大结果落盘（必须最先，理由见下）
 messages[:] = snip_compact(messages)          # L1: 裁中间消息
-messages[:] = micro_compact(messages)         # L2: 旧结果占位符
-
+messages[:] = micro_compact(messages)         # L2: 旧结果换占位符
 if estimate_size(messages) > CONTEXT_LIMIT:
-    messages[:] = compact_history(messages)   # L4
+    messages[:] = compact_history(messages)   # L4: 最贵的一层，放最后
 
-try:
-    response = client.messages.create(...)
-except Exception as e:
-    # API 报 prompt 过长：压缩后重试，reactive_retries 限制只能试一次
-    if "prompt_too_long" in str(e).lower() and reactive_retries < MAX_REACTIVE_RETRIES:
-        messages[:] = reactive_compact(messages)
-        reactive_retries += 1
-        continue
-    raise
+# 应急兜底：client.messages.create(...) 抛 prompt_too_long 时，用 reactive_compact
+# （摘要 + 最近 5 条）压缩后重试；reactive_retries 限制只能试一次，仍失败就往外抛
 ```
 
 ### 要点与取舍
@@ -720,13 +622,10 @@ def assemble_system_prompt(context: dict) -> str:
     return "\n\n".join(sections)
 
 def update_context(context: dict, messages: list) -> dict:
-    """从真实状态派生上下文：可用工具列表 + 工作目录 + 记忆文件内容。"""
-    memories = ""
-    if MEMORY_INDEX.exists():
-        memories = MEMORY_INDEX.read_text(encoding="utf-8").strip()
-    return {"enabled_tools": list(TOOL_HANDLERS.keys()),
+    """从真实状态派生上下文——这三项全是运行态事实，不是从对话内容里猜的。"""
+    return {"enabled_tools": list(TOOL_HANDLERS.keys()),   # 哪些工具真的注册了
             "workspace": str(WORKDIR),
-            "memories": memories}
+            "memories": MEMORY_INDEX.read_text().strip() if MEMORY_INDEX.exists() else ""}
 ```
 
 再包一层缓存，只在 context 真的变了才重新拼：
@@ -809,31 +708,26 @@ if response.stop_reason == "max_tokens":
 **路径三：瞬时故障**。指数退避 + 抖动，连续 3 次 529 切备用模型：
 
 ```python
-# retry_delay(attempt): 按下方公式算退避时长；MAX_RETRIES=10，MAX_CONSECUTIVE_529=3
-# FALLBACK_MODEL: 备用模型名，未配置时为空字符串
+# retry_delay(attempt) = min(500 * 2^attempt, 32000) ms + 0~25% 随机抖动，
+#   服务端返回 Retry-After 时优先采用；MAX_RETRIES=10，MAX_CONSECUTIVE_529=3
+# is_rate_limited / is_overloaded: 按异常类名与消息文本匹配 429 / 529
 def with_retry(fn, state: RecoveryState):
-    for attempt in range(MAX_RETRIES):            # 10
+    for attempt in range(MAX_RETRIES):
         try:
             result = fn()
-            state.consecutive_529 = 0             # 成功即清零
+            state.consecutive_529 = 0                  # 成功即清零
             return result
         except Exception as e:
-            name, msg = type(e).__name__, str(e).lower()
-            if "ratelimit" in name.lower() or "429" in msg:
-                time.sleep(retry_delay(attempt))
-                continue
-            if "overloaded" in name.lower() or "529" in msg:
+            if is_rate_limited(e):                     # 429：纯退避重试
+                time.sleep(retry_delay(attempt)); continue
+            if is_overloaded(e):                       # 529：退避 + 连续 3 次切备用模型
                 state.consecutive_529 += 1
                 if state.consecutive_529 >= MAX_CONSECUTIVE_529 and FALLBACK_MODEL:
-                    state.current_model = FALLBACK_MODEL
-                    state.consecutive_529 = 0
-                time.sleep(retry_delay(attempt))
-                continue
-            raise                                  # 不认识的错误往外抛
+                    state.current_model, state.consecutive_529 = FALLBACK_MODEL, 0
+                time.sleep(retry_delay(attempt)); continue
+            raise                                      # 不认识的错误往外抛
     raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
 ```
-
-退避公式：`min(500 * 2^attempt, 32000) ms + 0~25% 随机抖动`，若服务端返回 `Retry-After` 则优先采用。
 
 ### 要点与取舍
 
@@ -867,42 +761,25 @@ class Task:
 
 生命周期是三态机：`pending --claim--> in_progress --complete--> completed`。
 
-依赖检查是认领的前置硬约束（下面的 `load_task` / `save_task` / `list_tasks` 就是 `.tasks/` 目录的读写封装，`_task_path(id)` 拼出单个任务的文件路径）：
+依赖检查是认领的前置硬约束：
 
 ```python
-def can_start(task_id: str) -> bool:
-    task = load_task(task_id)
-    for dep_id in task.blockedBy:
-        if not _task_path(dep_id).exists():
-            return False                      # 依赖文件缺失 = 视为阻塞
-        if load_task(dep_id).status != "completed":
-            return False
-    return True
-
+# load_task / save_task / list_tasks 是 `.tasks/` 目录的读写封装
+# can_start(id): 遍历 blockedBy，任一依赖“文件不存在”或“status != completed”就返回 False
+#   —— 依赖文件缺失也算阻塞，是故意的保守选择
+# unfinished_deps(task): 挑出那些未完成的依赖 ID，只用于拼拒绝理由
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
         return f"Task {task_id} is {task.status}, cannot claim"
     if not can_start(task_id):
-        deps = [d for d in task.blockedBy
-                if not _task_path(d).exists() or load_task(d).status != "completed"]
-        return f"Blocked by: {deps}"
+        return f"Blocked by: {unfinished_deps(task)}"      # 依赖没完成就直接拒绝
     task.owner, task.status = owner, "in_progress"
     save_task(task)
     return f"Claimed {task.id} ({task.subject})"
 
-def complete_task(task_id: str) -> str:
-    task = load_task(task_id)
-    if task.status != "in_progress":
-        return f"Task {task_id} is {task.status}, cannot complete"
-    task.status = "completed"
-    save_task(task)
-    unblocked = [t.subject for t in list_tasks()
-                 if t.status == "pending" and t.blockedBy and can_start(t.id)]
-    msg = f"Completed {task_id} ({task.subject})"
-    if unblocked:
-        msg += f"\nUnblocked: {', '.join(unblocked)}"
-    return msg
+# complete_task(id) 是同构的“读 → 校验 status == in_progress → 写 completed”，
+#   额外在返回值里附一句 "Unblocked: ..."，列出因它完成而变得可认领的下游任务
 ```
 
 ### 要点与取舍
@@ -926,64 +803,41 @@ def complete_task(task_id: str) -> str:
 判断是慢操作就丢线程，立刻返回一个占位符：
 
 ```python
-_bg_counter = 0
 background_tasks: dict[str, dict] = {}   # bg_id -> {tool_use_id, command, status}
 background_results: dict[str, str] = {}  # bg_id -> 完成后的输出
 background_lock = threading.Lock()       # 保护上面两个字典
 
-def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
-    if tool_name != "bash":
-        return False
-    cmd = tool_input.get("command", "").lower()
-    slow_keywords = ["install", "build", "test", "deploy", "compile",
-                     "docker build", "pip install", "npm install",
-                     "cargo build", "pytest", "make"]
-    return any(kw in cmd for kw in slow_keywords)
-
+# is_slow_operation(name, input): bash 命令里含 install / build / test / deploy /
+#   compile / pytest / make 等关键词就算慢操作
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    if tool_input.get("run_in_background"):    # 模型显式要求，优先
-        return True
-    return is_slow_operation(tool_name, tool_input)   # 启发式兜底
+    return (tool_input.get("run_in_background")             # 模型显式要求，优先
+            or is_slow_operation(tool_name, tool_input))    # 启发式兜底
 
 def start_background_task(block) -> str:
-    global _bg_counter
-    _bg_counter += 1
-    bg_id = f"bg_{_bg_counter:04d}"
+    bg_id = f"bg_{next_bg_counter():04d}"
 
     def worker():
-        result = execute_tool(block)           # 就是主循环里同一条工具执行路径
+        result = execute_tool(block)          # 就是主循环里同一条工具执行路径
         with background_lock:
             background_tasks[bg_id]["status"] = "completed"
             background_results[bg_id] = result
 
     with background_lock:
-        background_tasks[bg_id] = {"tool_use_id": block.id,
-                                   "command": block.input.get("command", block.name),
-                                   "status": "running"}
-    threading.Thread(target=worker, daemon=True).start()   # 后台线程跑，不阻塞
+        background_tasks[bg_id] = {"tool_use_id": block.id, "status": "running",
+                                   "command": block.input.get("command", block.name)}
+    threading.Thread(target=worker, daemon=True).start()   # 不阻塞主循环
     return bg_id
 ```
 
 完成的结果以 XML 通知的形式注入下一轮：
 
 ```python
-def collect_background_results() -> list[str]:
-    with background_lock:
-        ready_ids = [bid for bid, t in background_tasks.items()
-                     if t["status"] == "completed"]
-    notifications = []
-    for bg_id in ready_ids:
-        with background_lock:
-            task = background_tasks.pop(bg_id)          # pop：取走即删
-            output = background_results.pop(bg_id, "")
-        notifications.append(
-            f"<task_notification>\n"
-            f"  <task_id>{bg_id}</task_id>\n"
-            f"  <status>completed</status>\n"
-            f"  <command>{task['command']}</command>\n"
-            f"  <summary>{output[:200]}</summary>\n"
-            f"</task_notification>")
-    return notifications
+# collect_background_results(): 扫出 status == "completed" 的任务，逐个从两个字典里
+#   **pop**（取走即删，否则下一轮会重复注入），拼成一条通知：
+#     <task_notification>
+#       <task_id>bg_0001</task_id><status>completed</status>
+#       <command>npm install</command><summary>{输出前 200 字}</summary>
+#     </task_notification>
 ```
 
 通知和当轮的 `tool_result` **合并在同一条 user 消息里**发出去，模型在一轮内同时看到两者，可以综合决策。
@@ -1043,32 +897,21 @@ def cron_matches(cron_expr: str, dt: datetime) -> bool:
     return dom_ok or dow_ok
 ```
 
-调度线程和队列处理线程：
+调度线程只管“到点没”，队列处理线程只管“Agent 空不空”：
 
 ```python
-def cron_scheduler_loop():
-    while True:
-        time.sleep(1)
-        now = datetime.now()
-        minute_marker = now.strftime("%Y-%m-%d %H:%M")   # 日期感知，防跨天重复
-        with cron_lock:
-            for job in list(scheduled_jobs.values()):
-                try:
-                    if cron_matches(job.cron, now):
-                        if _last_fired.get(job.id) != minute_marker:
-                            cron_queue.append(job)
-                            _last_fired[job.id] = minute_marker
-                        if not job.recurring:
-                            scheduled_jobs.pop(job.id, None)
-                            if job.durable: save_durable_jobs()
-                except Exception as e:
-                    print(f"[cron error] {job.id}: {e}")   # 单 job 异常隔离
+# cron_scheduler_loop(): 守护线程，每 1s 轮询一次 scheduled_jobs：
+#   · minute_marker = now.strftime("%Y-%m-%d %H:%M")，带日期，防同一时刻跨天被跳过
+#   · cron_matches 命中且 _last_fired[job.id] != minute_marker 才入队，一分钟只触发一次
+#   · 非 recurring 的 job 触发后摘掉；durable 的顺手 save_durable_jobs()
+#   · 每个 job 单独 try/except —— 一个写错的表达式不该让整个调度线程死掉
 
 def queue_processor_loop():
+    """守护线程，每 0.2s 检查。队列非空且 Agent 空闲时才唤醒一轮。"""
     while True:
         time.sleep(0.2)
         if not has_cron_queue(): continue
-        if not agent_lock.acquire(blocking=False):   # 非阻塞：Agent 忙就跳过
+        if not agent_lock.acquire(blocking=False):   # 非阻塞：Agent 忙就跳过，绝不插队
             continue
         try:
             if not has_cron_queue(): continue        # 双重检查
@@ -1100,21 +943,19 @@ def queue_processor_loop():
 
 ```python
 class MessageBus:
-    """基于文件的消息总线。每个 Agent 一个 .jsonl 收件箱。
-    读取即消费：read_text + unlink（取走就删除）。"""
+    """基于文件的消息总线。每个 Agent 一个 .jsonl 收件箱，读取即消费。"""
 
     def send(self, from_agent, to_agent, content, msg_type="message", metadata=None):
         msg = {"from": from_agent, "to": to_agent, "content": content,
                "type": msg_type, "metadata": metadata or {}, "ts": time.time()}
-        with open(MAILBOX_DIR / f"{to_agent}.jsonl", "a") as f:
+        with open(MAILBOX_DIR / f"{to_agent}.jsonl", "a") as f:   # 追加写
             f.write(json.dumps(msg) + "\n")
 
     def read_inbox(self, agent) -> list[dict]:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists(): return []
-        msgs = [json.loads(l) for l in inbox.read_text(encoding="utf-8").splitlines()
-                if l.strip()]
-        inbox.unlink()      # 消费：先读后删
+        msgs = [json.loads(l) for l in inbox.read_text().splitlines() if l.strip()]
+        inbox.unlink()      # 消费：先读后删（非原子，见本节取舍）
         return msgs
 ```
 
@@ -1127,17 +968,12 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
 
     def run():
         messages = [{"role": "user", "content": prompt}]
-        sub_tools = [bash, read_file, write_file, send_message]   # 只有 4 个
-        for _ in range(10):                                       # 10 轮上限
-            inbox = BUS.read_inbox(name)
-            if inbox:
-                messages.append({"role": "user",
-                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-            response = client.messages.create(
-                model=MODEL, system=system,
-                messages=messages[-20:],                          # 上下文切片
-                tools=sub_tools, max_tokens=8000)
-            ...
+        # 跑的还是第 1 节那个循环，四处不同：
+        #   ① 每轮开头先 BUS.read_inbox(name)，有信就作为 <inbox>...</inbox> 注入
+        #   ② 工具集只有 4 个：bash / read_file / write_file / send_message
+        #   ③ 上下文不走压缩管线，直接 messages[-20:] 切片
+        #   ④ 10 轮上限；跑完取自己最后一条 assistant 文本当 summary（不额外调 LLM）
+        summary = run_teammate_loop(name, role, messages, max_rounds=10)
         BUS.send(name, "lead", summary, "result")
         active_teammates.pop(name, None)
 
@@ -1206,20 +1042,15 @@ pending_requests: dict[str, ProtocolState] = {}   # request_id -> 状态
 响应匹配做三关校验：
 
 ```python
+EXPECTED = {"shutdown": "shutdown_response",
+            "plan_approval": "plan_approval_response"}
+
+# 三关各自会打一行 `[protocol] ...` 日志，此处省略
 def match_response(response_type: str, request_id: str, approve: bool):
     state = pending_requests.get(request_id)
-    if not state:                                   # 第一关：请求是否存在
-        print(f"[protocol] unknown request_id: {request_id}")
-        return
-    if state.type == "shutdown" and response_type != "shutdown_response":
-        print("[protocol] type mismatch ...")       # 第二关：类型是否匹配
-        return
-    if state.type == "plan_approval" and response_type != "plan_approval_response":
-        print("[protocol] type mismatch ...")
-        return
-    if state.status != "pending":                   # 第三关：是否已处理过
-        print(f"[protocol] {request_id} already {state.status}, ignoring duplicate")
-        return
+    if not state:                              return   # 第一关：请求存在？挡伪造/过期
+    if response_type != EXPECTED[state.type]:  return   # 第二关：类型匹配？挡错配
+    if state.status != "pending":              return   # 第三关：处理过了？挡重复投递
     state.status = "approved" if approve else "rejected"
 ```
 
@@ -1229,38 +1060,23 @@ def match_response(response_type: str, request_id: str, approve: bool):
 
 ```python
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
-    """读取 Lead 收件箱。自动路由协议响应 → 返回所有消息。"""
+    """Lead 收件箱的**唯一**消费入口。顺便自动路由协议响应，然后返回所有消息。"""
     msgs = BUS.read_inbox("lead")
     if route_protocol:
         for msg in msgs:
             meta = msg.get("metadata", {})
-            req_id = meta.get("request_id", "")
-            if req_id and msg.get("type", "").endswith("_response"):
-                match_response(msg["type"], req_id, meta.get("approve", False))
+            if meta.get("request_id") and msg.get("type", "").endswith("_response"):
+                match_response(msg["type"], meta["request_id"], meta.get("approve", False))
     return msgs
 ```
 
 队友这一侧的变化是：干完活不再退出，而是进入空闲等待。
 
 ```python
-if response.stop_reason != "tool_use":
-    # 空闲状态：等待收件箱消息而非退出
-    while not shutdown_requested:
-        time.sleep(1)
-        inbox = BUS.read_inbox(name)
-        if not inbox: continue
-        for msg in inbox:
-            if msg.get("type") in ("shutdown_request", "plan_approval_response"):
-                if handle_inbox_message(name, msg, messages):
-                    shutdown_requested = True
-                    break
-            else:
-                non_protocol.append(msg)
-        if shutdown_requested: break
-        if non_protocol:
-            messages.append({"role": "user",
-                             "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>"})
-            break                      # 带着新消息回到 LLM 轮次
+# 干完活后不再退出，而是：while not shutdown_requested，每 1s 读一次自己的收件箱：
+#   · shutdown_request / plan_approval_response → 交给 handle_inbox_message，
+#     它返回 True 表示该关机，置 shutdown_requested 并退出
+#   · 其他普通消息 → 拼成 <inbox>...</inbox> 注入 messages，break 回到 LLM 轮次
 ```
 
 队友的定位从"干 10 轮就走"变成了"有活就干，没活就等，收到关机才退"。
@@ -1316,33 +1132,27 @@ def scan_unclaimed_tasks() -> list[dict]:
 
 ```python
 def idle_poll(agent_name, messages, name, role) -> str:
-    """空闲轮询（60s 超时，5s 间隔）。返回 'work' / 'shutdown' / 'timeout'。"""
-    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):     # 60 // 5 = 12 次
+    """空闲轮询：每 5s 一轮，最多 12 轮（60s）。返回 'work' / 'shutdown' / 'timeout'。"""
+    for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
 
-        # 通道一：收件箱（协议消息优先）
-        inbox = BUS.read_inbox(agent_name)
+        inbox = BUS.read_inbox(agent_name)     # 通道一：收件箱，必须排在任务板之前
         if inbox:
-            for msg in inbox:
-                if msg.get("type") == "shutdown_request":
-                    req_id = msg.get("metadata", {}).get("request_id", "")
-                    BUS.send(name, "lead", "Shutting down gracefully.",
-                             "shutdown_response", {"request_id": req_id, "approve": True})
-                    return "shutdown"
+            # 含 shutdown_request：回一条带同 request_id 的 shutdown_response 后退出
+            if any(m.get("type") == "shutdown_request" for m in inbox):
+                reply_shutdown(name, inbox)
+                return "shutdown"
             messages.append({"role": "user",
                              "content": "<inbox>" + json.dumps(inbox) + "</inbox>"})
             return "work"
 
-        # 通道二：任务板
-        unclaimed = scan_unclaimed_tasks()
-        if unclaimed:
-            task = unclaimed[0]
-            if "Claimed" in claim_task(task["id"], agent_name):
-                messages.append({"role": "user",
-                    "content": f"<auto-claimed>Task {task['id']}: {task['subject']}</auto-claimed>"})
-                return "work"
-    # 通道三：超时
-    return "timeout"
+        unclaimed = scan_unclaimed_tasks()     # 通道二：任务板
+        if unclaimed and "Claimed" in claim_task(unclaimed[0]["id"], agent_name):
+            messages.append({"role": "user", "content":
+                f"<auto-claimed>Task {unclaimed[0]['id']}: "
+                f"{unclaimed[0]['subject']}</auto-claimed>"})
+            return "work"
+    return "timeout"                           # 通道三：超时
 ```
 
 ### 要点与取舍
@@ -1391,7 +1201,7 @@ def create_worktree(name: str, task_id: str = "") -> str:
     return f"Worktree '{name}' created at {path}"
 
 def bind_task_to_worktree(task_id: str, worktree_name: str):
-    """绑定任务到 worktree。仅写 worktree 字段，保持 status=pending 供自动认领。"""
+    """只写 worktree 字段，保持 status=pending 供自动认领（理由见下）。"""
     task = load_task(task_id)
     task.worktree = worktree_name
     save_task(task)
@@ -1400,26 +1210,18 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
 删除时做安全检查，有未提交内容默认拒绝：
 
 ```python
-def _count_worktree_changes(path: Path) -> tuple[int, int]:
-    r1 = subprocess.run(["git", "status", "--porcelain"], cwd=path, ...)
-    files = len([l for l in r1.stdout.strip().splitlines() if l.strip()])
-    r2 = subprocess.run(["git", "log", "@{push}..HEAD", "--oneline"], cwd=path, ...)
-    commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
-    return files, commits
-
+# _count_worktree_changes(path) -> (files, commits)：分别数 `git status --porcelain`
+#   和 `git log @{push}..HEAD` 的输出行数；查询本身失败时返回 -1
 def remove_worktree(name: str, discard_changes: bool = False) -> str:
-    ...
     if not discard_changes:
         files, commits = _count_worktree_changes(path)
-        if files < 0:
-            return ("Cannot verify worktree status. "
-                    "Use discard_changes=true to force removal.")
-        if files > 0 or commits > 0:
-            return (f"Worktree '{name}' has {files} uncommitted file(s) "
-                    f"and {commits} unpushed commit(s). "
-                    "Use discard_changes=true to force removal, "
+        if files < 0:                       # 验证不了就不动手
+            return "Cannot verify worktree status. Use discard_changes=true to force."
+        if files > 0 or commits > 0:        # 有未提交/未推送内容，默认拒绝
+            return (f"Worktree '{name}' has {files} uncommitted file(s) and "
+                    f"{commits} unpushed commit(s). Use discard_changes=true to force, "
                     "or keep_worktree to preserve for review.")
-    ...
+    # ... git worktree remove + log_event("remove", name) ...
 ```
 
 队友侧用一个 dict 做闭包内的可变引用，跟踪"当前在哪个目录干活"：
@@ -1452,14 +1254,8 @@ MCP（Model Context Protocol，一种让外部服务向 Agent 暴露工具的开
 
 ```python
 class MCPClient:
-    def __init__(self, name: str):
-        self.name = name
-        self.tools: list[dict] = []                    # 面向 LLM 的 schema
-        self._handlers: dict[str, callable] = {}       # 面向执行的函数
-
-    def register(self, tool_defs: list[dict], handlers: dict[str, callable]):
-        self.tools = tool_defs
-        self._handlers = handlers
+    """一个实例管一个外部服务。tools 是面向 LLM 的 schema，_handlers 是面向执行的函数，
+    两者由 register(tool_defs, handlers) 写入。"""
 
     def call_tool(self, tool_name: str, args: dict) -> str:
         handler = self._handlers.get(tool_name)
@@ -1476,22 +1272,15 @@ class MCPClient:
 ```python
 # BUILTIN_TOOLS / BUILTIN_HANDLERS: 前 18 节的内置工具定义表与 handler 表
 # mcp_clients: dict[str, MCPClient]，已连接的外部服务，connect_mcp 时写入
-_DISALLOWED_CHARS = re.compile(r'[^a-zA-Z0-9_-]')
-
-def normalize_mcp_name(name: str) -> str:
-    """安全规范化名称：非 [a-zA-Z0-9_-] 字符替换为下划线。"""
-    return _DISALLOWED_CHARS.sub('_', name)
-
+# normalize_mcp_name(s): 把非 [a-zA-Z0-9_-] 的字符替换成下划线
 def assemble_tool_pool() -> tuple[list[dict], dict]:
-    """组装完整工具池：内置工具 + 所有已连接 MCP 服务器的工具。
-    MCP 工具名格式: mcp__{server}__{tool}"""
+    """内置工具 + 所有已连接 MCP 服务的工具。MCP 工具名格式 mcp__{server}__{tool}"""
     tools = list(BUILTIN_TOOLS)            # 拷贝，不改原表
     handlers = dict(BUILTIN_HANDLERS)
     for server_name, mcp_client in mcp_clients.items():
-        safe_server = normalize_mcp_name(server_name)
         for tool_def in mcp_client.tools:
-            safe_tool = normalize_mcp_name(tool_def["name"])
-            prefixed = f"mcp__{safe_server}__{safe_tool}"
+            prefixed = (f"mcp__{normalize_mcp_name(server_name)}"
+                        f"__{normalize_mcp_name(tool_def['name'])}")
             tools.append({"name": prefixed,
                           "description": tool_def.get("description", ""),
                           "input_schema": tool_def.get("inputSchema", {})})
@@ -1530,7 +1319,46 @@ def assemble_tool_pool() -> tuple[list[dict], dict]:
 
 ### 主循环的 7 步
 
-下面代码里几个辅助函数都是前面各节机制的封装：`consume_cron_queue` 取出到点的定时任务（第 14 节），`inject_background_notifications` 注入后台完成通知（第 13 节），`prepare_context` 跑第 8 节的四层压缩，`call_llm` 用第 11 节的 `with_retry` 包住模型调用，`has_tool_use` / `call_tool_handler` / `build_user_content` 分别是"本轮有无工具调用"判定、单个工具执行、把 tool_result 与后台通知合并成一条 user 消息。
+下面把七个挂载点标在第 1 节那个骨架上。每个辅助函数都是前面某一节机制的封装，后面括号注明出处；`tool_result(block, content)` 是把内容包成 `{"type": "tool_result", "tool_use_id": block.id, "content": ...}` 的简写。
+
+```python
+def agent_loop(messages: list, context: dict):
+    state = RecoveryState()
+    max_tokens = DEFAULT_MAX_TOKENS
+
+    while True:
+        inject_scheduled_and_background(messages)   # ① 定时队列 + 后台完成通知（13/14）
+        nag_todos_if_stale(messages)                # ② >= 3 轮未更新就塞一条提醒（05）
+        prepare_context(messages)                   # ③ budget → snip → micro → compact（08）
+        context = update_context(context, messages) # ④ system prompt 与工具池实时组装
+        tools, handlers = assemble_tool_pool()      #    （10/19，每轮重算，不缓存）
+
+        # ⑤ 包住 with_retry + max_tokens 8K→64K 升级 + prompt_too_long 应急压缩（11）
+        response = call_llm(messages, context, tools, state, max_tokens)
+        messages.append({"role": "assistant", "content": response.content})
+
+        if not has_tool_use(response.content):
+            trigger_hooks("Stop", messages)         # Stop hook 返回非 None 则强制续跑（04）
+            return
+
+        results = []
+        for block in response.content:              # ⑥ 逐个执行工具调用
+            if block.type != "tool_use": continue
+            if block.name == "compact":             # compact 在权限之前截获，不走 handler
+                messages[:] = compact_history(messages); break
+            blocked = trigger_hooks("PreToolUse", block)          # 权限闸门（03/04）
+            if blocked:
+                results.append(tool_result(block, str(blocked))); continue
+            if should_run_background(block.name, block.input):    # 慢操作丢后台（13）
+                results.append(tool_result(block, start_background_task(block, handlers)))
+                continue
+            output = call_tool_handler(handlers.get(block.name), block.input, block.name)
+            trigger_hooks("PostToolUse", block, output)
+            results.append(tool_result(block, output))
+
+        # ⑦ tool_result 与后台通知合并成一条 user 消息追加回去
+        messages.append({"role": "user", "content": build_user_content(results)})
+```
 
 ```mermaid
 flowchart TD
@@ -1543,95 +1371,6 @@ flowchart TD
     S6 -->|是| S7["⑥ 逐个执行：compact 截获 → 权限闸门<br/>→ 后台分发 → 工具执行（03/04/13 节）"]
     S7 --> S8["⑦ 合并 tool_result + 后台通知<br/>追加 messages"]
     S8 --> S1
-```
-
-```python
-def agent_loop(messages: list, context: dict):
-    global rounds_since_todo
-    tools, handlers = assemble_tool_pool()
-    state = RecoveryState()
-    max_tokens = DEFAULT_MAX_TOKENS
-
-    while True:
-        # ① 注入定时任务队列 + 后台任务完成通知
-        for job in consume_cron_queue():
-            messages.append({"role": "user", "content": f"[Scheduled] {job.prompt}"})
-        inject_background_notifications(messages)
-
-        # ② todo 提醒（>= 3 轮未更新）
-        if rounds_since_todo >= 3:
-            messages.append({"role": "user",
-                             "content": "<reminder>Update your todos.</reminder>"})
-            rounds_since_todo = 0
-
-        # ③ 上下文预算管道（budget → snip → micro → compact）
-        prepare_context(messages)
-        context = update_context(context, messages)
-        tools, handlers = assemble_tool_pool()       # ④ 实时工具池 + system prompt
-
-        # ⑤ LLM 调用（with_retry + max_tokens 升级 + reactive compact）
-        try:
-            response = call_llm(messages, context, tools, state, max_tokens)
-        except Exception as e:
-            if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
-                messages[:] = reactive_compact(messages)
-                state.has_attempted_reactive_compact = True
-                continue
-            messages.append({"role": "assistant", "content": [
-                {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
-            return
-
-        if response.stop_reason == "max_tokens":
-            if not state.has_escalated:
-                max_tokens = ESCALATED_MAX_TOKENS
-                state.has_escalated = True
-                continue
-            ...  # 续写路径
-
-        max_tokens = DEFAULT_MAX_TOKENS      # 成功后复位
-        state.has_escalated = False
-        messages.append({"role": "assistant", "content": response.content})
-
-        if not has_tool_use(response.content):
-            trigger_hooks("Stop", messages)
-            return
-
-        # ⑥ 遍历 tool_use block
-        results = []
-        for block in response.content:
-            if block.type != "tool_use": continue
-
-            if block.name == "compact":               # compact 单独截获
-                messages[:] = compact_history(messages)
-                messages.append({"role": "user",
-                                 "content": "[Compacted. Continue with summarized context.]"})
-                compacted_now = True
-                break
-
-            blocked = trigger_hooks("PreToolUse", block)     # 权限闸门
-            if blocked:
-                results.append({"type": "tool_result",
-                                "tool_use_id": block.id, "content": str(blocked)})
-                continue
-
-            if should_run_background(block.name, block.input):   # 慢操作丢后台
-                bg_id = start_background_task(block, handlers)
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": f"[Background task {bg_id} started] ..."})
-                continue
-
-            handler = handlers.get(block.name)
-            output = call_tool_handler(handler, block.input, block.name)
-            trigger_hooks("PostToolUse", block, output)
-
-            rounds_since_todo = 0 if block.name == "todo_write" else rounds_since_todo + 1
-            results.append({"type": "tool_result",
-                            "tool_use_id": block.id, "content": output})
-
-        if compacted_now: continue
-
-        # ⑦ 合并 tool_result + 后台通知 → 追加 messages
-        messages.append({"role": "user", "content": build_user_content(results)})
 ```
 
 对比第 1 节那 20 行，结构完全一样：**发消息 → 判断 → 执行 → 回传**。多出来的全是挂在特定位置的机制。
@@ -1708,24 +1447,5 @@ todo nag、后台通知、定时任务注入、收件箱注入、Stop hook 续�
 | MCP | mock handler | 真实 transport / OAuth / 资源订阅 |
 | 会话 | 单会话 | resume / fork + worktree 完整生命周期 |
 
----
+完整可运行的最小实现见 [shareAI-lab/learn-claude-code](https://github.com/shareAI-lab/learn-claude-code)。
 
-## 落地建议
-
-如果要把这套结构用在自己的业务场景里，按这个顺序推进风险最低：
-
-1. **先做 01–04**：循环、工具表、权限管线、hook 注册表。这四层是地基，后面所有机制都挂在上面。**尤其 hook 系统要早做**——一旦开始往循环里塞 if/elif，后面每加一个功能都在还技术债。
-2. **然后是 08 + 12**：上下文压缩和落盘任务图。这两个决定了 Agent 能不能处理"跑一小时以上"的任务。没有它们，Agent 只能做小任务。
-3. **07 + 09 按需**：如果领域知识多（内部规范、API 文档、流程约定），先做 skill loading；如果重复交互多（同一批人反复用），先做 memory。
-4. **多 Agent（15–18）最后做**。它的复杂度和收益都集中在"大规模并行改代码"这一类场景。单 Agent 加 subagent（06）能覆盖大部分日常需求，先把单 Agent 做扎实。
-5. **工具设计上花的时间不会浪费**。工具描述、参数 schema、错误返回文案，直接决定模型的调用准确率。这部分投入的产出比调 prompt 高得多。
-
----
-
-## 学习方法上的一点体会
-
-拆这套东西最有效的方式不是从头到尾读文档，而是**先写一个 20 行的最小循环跑通，再逐个往上加机制**。每加一层都会自然遇到一个具体问题（上下文爆了、工具加不动了、权限管不住了），这时候再去看真实实现怎么解决，理解会深得多。反过来先看完整架构图，很容易记住了组件名字却不知道每个组件在挡什么问题。
-
-另一个体会是：这套机制里绝大部分设计不是为了让 Agent "更聪明"，而是为了让它**在环境里不出错**——压缩要保留断层标记、拒绝要能被模型看见、删目录前要先查未提交变更、闭包要显式绑定默认参数。**harness 工程的本质更接近可靠性工程，而不是提示词工程。**
-
-最后一句总结：这类工作不是在编写智能，而是在构建智能栖居的环境。这个环境的质量——Agent 能看多清楚、行动多精准、可用知识有多丰富——直接决定了模型能力有多少能真正兑现出来。
