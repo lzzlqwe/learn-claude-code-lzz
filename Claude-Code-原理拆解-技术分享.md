@@ -250,7 +250,7 @@ if not check_permission(block):
 ### 要点与取舍
 
 - **Gate 3 默认拒绝**。`ask_user` 只有输入 `y`/`yes` 才放行，回车即拒绝。审批交互一定要设计成 fail-closed（判断不了或无人应答时一律拒绝）。
-- **字符串黑名单不是安全机制**。命令变体、shell 展开、base64 解码、拿 `$IFS`（shell 的内部分隔符变量）拼接都能绕过。它挡的是"模型手滑"，不是"有人故意攻击"。真要防后者得上命令行语法树（AST）解析 + 沙箱。
+- **字符串黑名单不是安全机制**。命令变体、shell 展开、base64 解码、拿 `$IFS`（shell 的内部分隔符变量）拼接都能绕过。它挡的是"模型手滑"，不是"有人故意攻击"。真要防后者得使用命令行语法树（AST）解析 + 沙箱。
 - Claude Code 的实际复杂度在另一个量级：4 种权限决策结果（allow/deny/ask/passthrough）、8 个规则来源（用户设置、项目设置、本地设置、feature flag、企业策略、CLI 参数、内联命令、会话授权）、自动审批分类器，以及子 Agent 的权限请求向父 Agent 冒泡。
 
 ---
@@ -279,7 +279,7 @@ def trigger_hooks(event: str, *args):
     return None
 ```
 
-约定极简：**回调返回 `None` 表示放行，返回非 `None` 表示拦截**，并且第一个非 `None` 就短路。
+简单约定：**回调返回 `None` 表示放行，返回非 `None` 表示拦截**，并且第一个非 `None` 就短路。
 
 四个事件的语义：
 
@@ -315,7 +315,7 @@ if response.stop_reason != "tool_use":
 
 ### 要点与取舍
 
-Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一个 `stopHookActive` 标志防止 Stop hook 无限续跑（否则 hook 和模型可以互相顶牛顶到 token 耗尽）。最小实现只保留 4 个事件。
+Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一个 `stopHookActive` 标志防止 Stop hook 无限续跑（否则 hook 和模型可以拉扯到 token 耗尽）。最小实现只保留 4 个常见事件。
 
 ---
 
@@ -327,7 +327,7 @@ Claude Code 有 27 个 hook 事件、14 字段的 hook 结果对象，还有一�
 
 ### 实现
 
-一个**不干实事**的工具——它不读文件、不跑命令，只把计划写下来：
+一个**不干实事**的工具 `todo_write` ——它不读文件、不跑命令，只把 todo 计划写/更新下来：
 
 ```python
 CURRENT_TODOS: list[dict] = []     # 进程内存，退出即丢
@@ -339,7 +339,7 @@ def run_todo_write(todos: list) -> str:
     return f"Updated {len(todos)} tasks"
 ```
 
-再配一个 nag 机制（周期性提醒）：连续 3 轮没调用 `todo_write`，就往消息流里塞一条提醒。
+再配一个 nag 机制（周期性提醒）：连续 3 轮没调用 `todo_write` 工具，就往消息流里塞一条提醒。
 
 ```python
 rounds_since_todo = 0              # 计数器：连续多少轮没更新 todo
@@ -352,7 +352,7 @@ rounds_since_todo = 0              # 计数器：连续多少轮没更新 todo
 
 ### 要点与取舍
 
-- **软引导 + 硬提醒的两层结构**：system prompt 说"请先规划"是软引导，模型可能不听；nag 是硬提醒，每 3 轮必到。两者互补，缺一个效果都会掉。
+- **软引导 + 硬提醒的两层结构**：system prompt 说"请先规划"是软引导，模型可能不听；nag 是硬提醒，每 3 轮必到。两者互补，缺一个会影响效果。
 - **提醒不是报错**。它不拒绝执行、不打断循环，只是在上下文里放一条信息让模型自己看到。这类"非破坏性纠偏"在 Agent 工程里很常用——同样的手法后面还会用于后台任务通知（第 13 节）、定时任务注入（第 14 节）、收件箱注入（第 15 节）。
 - 最小实现的 TODO 存在进程内存里，退出即丢。Claude Code 是内存版 TodoWrite 和落盘版 Task System 并存，各管一层（见第 12 节）。
 
@@ -362,7 +362,7 @@ rounds_since_todo = 0              # 计数器：连续多少轮没更新 todo
 
 ### 问题
 
-"分析这 30 个文件里的重复逻辑"——如果在主对话里做，30 个文件的全文会留在 `messages` 里，这些中间过程占着上下文位置，让 Agent 越来越"健忘"，它都记不住最初的问题是什么了。但主 Agent 真正需要的其实只是一句结论。
+"分析这 30 个文件里的重复逻辑"——如果在主对话里做，30 个文件的全文会留在 `messages` 里，这些中间过程占着上下文位置，让 Agent 越来越"健忘"，导致它都记不住最初的问题是什么了。但主 Agent 真正需要的其实只是一句结论。
 
 ### 实现
 
@@ -389,7 +389,7 @@ def spawn_subagent(description: str) -> str:
 
 1. **禁止递归靠"没有 task 工具"，不靠判断层数**。`SUB_TOOLS` 里根本没有 `task` 工具，模型看不到它，自然调不出来。这是硬约束，比"检查 depth < 3"更可靠。
 2. **上下文隔离 ≠ 权限隔离**。子 Agent 的每次工具调用同样走 `PreToolUse` hook。隔离的是"看到什么"，不是"能干什么"。
-3. **返回值是摘要，不是历史**。如果回传 `messages` 会丢失隔离的意义。
+3. **返回值是摘要，不是历史**。如果回传子 Agent 的 `messages` 会丢失隔离的意义。
 
 ### 要点与取舍
 
@@ -415,7 +415,7 @@ SKILL_REGISTRY: dict[str, dict] = {}   # name -> {name, description, content}
 #   按 name（缺失则用目录名）写入 SKILL_REGISTRY；description 缺失则取正文首行
 # list_skills(): 把 SKILL_REGISTRY 拼成 "- **name**: description" 的多行文本
 
-def build_system() -> str:                     # Layer 1：只注入目录
+def build_system() -> str:                     # Layer 1：只注入目录到 System Prompt
     return (f"You are a coding agent at {WORKDIR}. "
             f"Skills available:\n{list_skills()}\n"
             "Use load_skill to get full details when needed.")
@@ -426,7 +426,7 @@ def load_skill(name: str) -> str:              # Layer 2：按需拉全文
     return skill["content"] if skill else f"Skill not found: {name}"
 ```
 
-成本对比很直观：
+成本最直观的对比：
 
 | 层级 | 内容 | 量级 | 频率 |
 |---|---|---|---|
@@ -464,12 +464,14 @@ flowchart TD
     RC -.-> CALL
 ```
 
-| 层 | 触发条件 | 做什么 | API |
+| 压缩管道层 | 触发条件 | 做什么 | API |
 |---|---|---|---|
 | **L3** `tool_result_budget` | 最新一轮 tool_result 总量 > 200KB | 从最大的开始依次落盘到 `.tool_results/{tool_use_id}.txt`，上下文只留 `<persisted-output>` 里的路径 + 前 2000 字预览 | 0 |
 | **L1** `snip_compact` | 消息数 > 50 | 保留头 3 条 + 尾 47 条，中间换成一条 `[snipped N messages]` | 0 |
 | **L2** `micro_compact` | tool_result 数 > 3 | 除最近 3 个外，超 120 字的旧结果原地换成占位符 | 0 |
 | **L4** `compact_history` | 估算字符数 > 50K | 先 `write_transcript` 备份成 jsonl，再调 LLM 摘要，整个列表换成一条 `[Compacted]` 消息 | 1 次 |
+
+智能体主循环变为：压缩管线（L3 → L1 → L2 → 是否 L4） → LLM → hook → 执行 → reactive 兜底。
 
 四层里只有 L2 值得看代码——它是**原地改 block**，不是重建消息列表：
 
@@ -527,7 +529,7 @@ if estimate_size(messages) > CONTEXT_LIMIT:
 
 ### 问题
 
-第 8 节把 5000 条消息压成一段摘要，细节必然丢失。而且它只管**单次会话内**的连续性——关掉终端重开，Agent 又是一张白纸。"这个项目用 4 空格缩进"这种事，不该每次都重新说一遍。
+第 8 节把 5000 条消息压成一段摘要，细节必然丢失。而且它只管**单次会话内**的连续性——关掉终端新开一个会话，Agent 又得重新开始。对于"这个项目用 4 空格缩进"这种事，不该每次都重新说一遍。
 
 ### 实现
 
@@ -587,6 +589,22 @@ if response.stop_reason != "tool_use":
 
 **从压缩前的快照提取**。如果等压缩之后再提取，要记的细节可能已经被压掉了。
 
+整体流程变为：
+
+```python
+def agent_loop:
+   > 加载记忆：根据最近对话选相关记忆（LLM side-query，失败降级关键词匹配）relevant_memories
+   while true:
+      > 重建 SYSTEM：每轮拉取最新 MEMORY.md 索引注入 system prompt
+      > 保存快照：压缩前保存原始消息（留给后续 记忆提取 使用）
+      > 08压缩管线：budget → snip → micro → [超限则 auto compact]
+      > 记忆拼接：将相关记忆 relevant_memories 拼到当前 user turn，不污染原始 messages（不破坏 cache）
+      > LLM 调用 + 工具执行
+   退出循环后：
+   > 提取记忆：用LLM，提取前会先检查已有记忆，避免重复。
+   > 整理记忆：用LLM，低频合并去重
+```
+
 ### 要点与取舍
 
 - **为什么用 LLM 选记忆而不是 embedding**：模型能理解语义关联（"改登录逻辑"和"认证走 middleware/auth.ts"的关系），不需要维护向量库、不需要处理索引更新。代价是一次额外的小额 API 调用。Claude Code 同样用模型自己做这个选择。
@@ -645,7 +663,6 @@ def get_system_prompt(context: dict) -> str:
 
 - **`if memories:` 判断的是文件系统状态，不是对话内容**。哪些工具注册了、`.memory/MEMORY.md` 里有没有东西——这些是运行态事实。如果改成"在消息里搜 memory 这个词"，就会出现"用户提了一句记忆，但目录是空的，结果加载了一个空 section"这种情况。**按事实加载，不按关键词猜。**
 - **为什么用 `json.dumps(sort_keys=True)` 而不是 `hash()`**：`hash()` 有进程级随机化（`PYTHONHASHSEED`），跨进程不可靠；遇到 list/dict 直接 `unhashable type`。`json.dumps` 排序后是确定性字符串，同数据必然同 key。
-- **`assemble` 和 `get` 分开**：前者是纯函数只管拼接，后者有状态但对外透明。测试的时候只测 `assemble` 就够了。
 - 这里的缓存只是"避免重复拼字符串"，和 API 级的 prompt cache 是两件事。Claude Code 用一个动态边界把 prompt 切成不同 cache scope 的块，静态部分命中全局缓存——这也解释了为什么 prompt 的 section 顺序要稳定：顺序一变，缓存全失效。（顺带说，这个约束在第 19 节引入动态工具池之后被打破了，那一节会讲。）
 
 ---
@@ -705,7 +722,9 @@ if response.stop_reason == "max_tokens":
 
 **路径二：上下文超限**。捕获 `prompt_too_long`，`reactive_compact` 后重试一次（复用第 8 节的实现）。
 
-**路径三：瞬时故障**。指数退避 + 抖动，连续 3 次 529 切备用模型：
+**路径三：瞬时故障**。网络抖动、429 限流、529 过载——这些不是 bug，是分布式系统的常态。
+
+429 和 529 统一走指数退避 + 抖动。加随机抖动让并发请求不在同一时刻重试。连续 3 次 529 过载 → 切换到备用模型。
 
 ```python
 # retry_delay(attempt) = min(500 * 2^attempt, 32000) ms + 0~25% 随机抖动，
@@ -732,7 +751,7 @@ def with_retry(fn, state: RecoveryState):
 ### 要点与取舍
 
 - **8K→64K 不追加截断输出，这条容易被忽略但很关键**。8K 时截断的位置通常在句子中间，把这段半截内容追加进去再让模型续写，它得先猜自己刚才想说什么，输出质量会明显下降。直接丢掉重来更干净。64K 还截断说明内容本身就长，那时输出至少停在完整段落，才值得保留 + 续写。
-- **抖动不是可选项**。多个 Agent 实例同时被限流、同时按固定间隔重试，会形成惊群，把服务打得更死。25% 随机化把重试时刻打散。
+- **抖动不是可选项**。多个 Agent 实例同时被限流、同时按固定间隔重试，会把服务打得更死。25% 随机化把重试时刻打散。
 - **连续 3 次才切模型**。偶发一次 529 就切模型，会导致同一个会话在两个模型间反复跳，输出风格和能力都不稳定。
 - **分层：`with_retry` 只认它认识的错误**（429/529），其余原样抛出交给外层处理 `prompt_too_long`。每一层只处理自己该处理的错误类型，这是错误处理保持可维护的前提。
 
@@ -761,6 +780,11 @@ class Task:
 
 生命周期是三态机：`pending --claim--> in_progress --complete--> completed`。
 
+这里的 `claim` / `complete` 是动作，`pending` / `in_progress` / `completed` 是状态：
+
+- **claim_task**: `pending` → `in_progress`。设置 owner，开始工作。
+- **complete_task**: `in_progress` → `completed`。把任务标记为完成，并解锁下游。
+
 依赖检查是认领的前置硬约束：
 
 ```python
@@ -782,12 +806,17 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 #   额外在返回值里附一句 "Unblocked: ..."，列出因它完成而变得可认领的下游任务
 ```
 
+最主要的实现是 Agent 多了 5 个工具（create_task, list_tasks, get_task, claim_task, complete_task）
+
+每个 `create_task` 写一个 JSON 文件，每个 `claim_task` / `complete_task` 更新文件。跨会话时，`.tasks/` 目录还在，Agent 读文件就能恢复进度。
+
+
 ### 要点与取舍
 
 - **`blockedBy` 是硬约束不是建议**。依赖没完成，`claim_task` 直接拒绝。任务图本质是一个 DAG（有向无环图），其语义就是只能从入度为 0（无未完成依赖）的节点开始。
 - **依赖文件缺失也算阻塞**，这是保守选择。任务文件被误删时，宁可卡住等人处理，也不要当成"依赖已满足"往下跑。
 - **完成任务不自动启动下游**，只在返回值里告诉 Agent"这几个现在可以做了"。状态转换保持显式，Agent 拿到信息自己决定做哪个——避免隐式连锁反应带来的不可预测性。
-- **TodoWrite 和 Task System 是两层，不是二选一**：前者是 Agent 当前这一轮的执行清单（内存、轻量、高频更新），后者是项目级的目标管理（磁盘、有依赖、跨会话跨 Agent）。Claude Code 两者并存。
+- **TodoWrite 和 Task System 是两层，不是二选一**：前者是 Agent 当前这一轮的执行清单（内存、轻量、高频更新），后者是项目级的目标管理（磁盘持久化、有依赖、跨会话跨 Agent）。Claude Code 两者并存。
 - 最小实现没有环检测，也没有 ID 复用保护（Claude Code 用 highwatermark 文件记录已分配过的最大编号，避免新任务复用旧 ID）。
 
 ---
