@@ -829,7 +829,7 @@ def claim_task(task_id: str, owner: str = "agent") -> str:
 
 ### 实现
 
-判断是慢操作就丢线程，立刻返回一个占位符：
+判断是慢操作就丢线程，立刻返回一个占位符。判断主要通过两种方式：1. 模型通过 bash 工具的 `run_in_background` 参数显式请求后台执行。2. 兜底：判断 bash 命令里是否含 install / build / test / deploy 等关键词。
 
 ```python
 background_tasks: dict[str, dict] = {}   # bg_id -> {tool_use_id, command, status}
@@ -891,13 +891,13 @@ def start_background_task(block) -> str:
 四层，各管一件事，互不知道对方细节：
 
 ```
-Scheduler（守护线程，每 1s 轮询，判断"时间到了没"）
+Scheduler（守护线程，每 1s 轮询，判断"时间到了没"，还会额外判断是否持久化和重复触发）
     ↓ 写入
 cron_queue（队列）
     ↓ 读取
-Queue Processor（守护线程，每 0.2s 检查，判断"Agent 有空没"）
+Queue Processor（守护线程，每 0.2s 检查，判断队列非空且"Agent 有空没"）
     ↓ 唤醒
-agent_loop（消费队列，注入 "[Scheduled] {prompt}" 消息）
+agent_loop（消费队列中的 job，注入 "[Scheduled] {prompt}" 消息）
 ```
 
 ```python
@@ -910,31 +910,34 @@ class CronJob:
     durable: bool      # 落盘 / 仅会话内
 ```
 
-cron 表达式匹配里藏着一个经典坑：
+调度器跑在独立的 daemon 线程里，不依赖 agent_loop 是否在执行。单个 job 异常不会杀掉整个线程：
 
 ```python
-def cron_matches(cron_expr: str, dt: datetime) -> bool:
-    minute, hour, dom, month, dow = cron_expr.strip().split()
-    dow_val = (dt.weekday() + 1) % 7        # Python Monday=0 → cron Sunday=0
-    ...
-    if not (m and h and month_ok):
-        return False
-    # DOM 和 DOW 同时被约束时，任一匹配即可（OR，不是 AND）
-    if dom == "*" and dow == "*": return True
-    if dom == "*": return dow_ok
-    if dow == "*": return dom_ok
-    return dom_ok or dow_ok
+# cron_matches(expr, dt): 5 字段表达式匹配，里面两个坑——Python 的 weekday() 周一=0，
+#   要转成 cron 的周日=0；DOM 与 DOW 同时被约束时是 OR 语义（任一匹配即触发）
+def cron_scheduler_loop():
+    while True:
+        time.sleep(1)
+        now = datetime.now()
+        minute_marker = now.strftime("%Y-%m-%d %H:%M")
+        with cron_lock:
+            for job in list(scheduled_jobs.values()):
+                try:
+                    if cron_matches(job.cron, now):
+                        if _last_fired.get(job.id) != minute_marker: # 防止一分钟内抖动
+                            cron_queue.append(job) # 入队
+                            _last_fired[job.id] = minute_marker
+                        if not job.recurring:  # job 是否重复触发
+                            scheduled_jobs.pop(job.id, None)
+                            if job.durable: # 是否持久化
+                                save_durable_jobs()
+                except Exception as e:
+                    print(f"[cron error] {job.id}: {e}")
 ```
 
 调度线程只管“到点没”，队列处理线程只管“Agent 空不空”：
 
 ```python
-# cron_scheduler_loop(): 守护线程，每 1s 轮询一次 scheduled_jobs：
-#   · minute_marker = now.strftime("%Y-%m-%d %H:%M")，带日期，防同一时刻跨天被跳过
-#   · cron_matches 命中且 _last_fired[job.id] != minute_marker 才入队，一分钟只触发一次
-#   · 非 recurring 的 job 触发后摘掉；durable 的顺手 save_durable_jobs()
-#   · 每个 job 单独 try/except —— 一个写错的表达式不该让整个调度线程死掉
-
 def queue_processor_loop():
     """守护线程，每 0.2s 检查。队列非空且 Agent 空闲时才唤醒一轮。"""
     while True:
@@ -948,6 +951,8 @@ def queue_processor_loop():
         finally:
             agent_lock.release()
 ```
+
+生产者（调度线程）、交付者（queue processor）和消费者（agent_loop）通过 `cron_queue`、`cron_lock`、`agent_lock` 解耦。
 
 ### 要点与取舍
 
@@ -964,7 +969,7 @@ def queue_processor_loop():
 
 ### 问题
 
-大项目重构要同时改 5 个模块。第 6 节的子 Agent 是一次性的、同步的、用完即销毁，没法"派出去以后还能继续对话"。
+大项目重构要同时改 5 个模块。上下文窗口就那么大，单个 Agent 的注意力覆盖不了所有模块，有些任务需要能通信、能协作的队友 Agent。但第 6 节的子 Agent 是一次性的、同步的、用完即销毁，没法"派出去以后还能继续干活"。
 
 ### 实现
 
@@ -972,7 +977,7 @@ def queue_processor_loop():
 
 ```python
 class MessageBus:
-    """基于文件的消息总线。每个 Agent 一个 .jsonl 收件箱，读取即消费。"""
+    """基于文件的消息总线。每个 Agent 一个 .mailboxes/xx.jsonl 收件箱，读取即消费。"""
 
     def send(self, from_agent, to_agent, content, msg_type="message", metadata=None):
         msg = {"from": from_agent, "to": to_agent, "content": content,
@@ -988,7 +993,7 @@ class MessageBus:
         return msgs
 ```
 
-派生队友：
+Lead Agent 有一个 `spawn_teammate_thread` 工具，可以派生队友：
 
 ```python
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
@@ -1011,7 +1016,7 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     return f"Teammate '{name}' spawned as {role}"
 ```
 
-Lead 侧在每轮 `agent_loop` 返回后自动收信并注入：
+队友跑完会把摘要信息发送给 Lead。Lead 侧在每轮 `agent_loop` 返回后自动收信并注入：
 
 ```python
 inbox = BUS.read_inbox("lead")
@@ -1022,7 +1027,7 @@ if inbox:
 
 ### 要点与取舍
 
-- **文件即邮箱**。不需要注册中心、连接管理、心跳保活。`send` 是追加写，`read_inbox` 是读完删除。这个方案的复杂度/能力比很高。
+- **文件即邮箱**。不需要注册中心、连接管理、心跳保活。`send` 是追加写，`read_inbox` 是读完删除。
 - **队友的工具集是受限的**：只有 bash / read / write / send_message。**不能 `spawn_teammate`**（防无限递归开线程）、不能调度 cron、不能认领任务。能力边界即安全边界。
 - **`messages[-20:]` 切片**：队友的上下文不做完整压缩管线，直接截断。够用，且省事。
 - **摘要不调 LLM**：从自己的历史里取最后一条 assistant 文本作为结果，省一次 API 调用。
@@ -1041,7 +1046,16 @@ Lead 让队友关机，队友回一句"ok"。Lead 怎么知道这个"ok"是回�
 
 ### 实现
 
+两种协议，一套机制：
+
+| 协议 | 方向 | 用途 |
+|------|------|------|
+| shutdown_request / response | Lead → 队友 | 体面关机握手 |
+| plan_approval_request / response | 队友 → Lead | 计划审批协议示例 |
+
 给每次交互一个 `request_id`，用状态表追踪。协议消息把 `request_id`、`approve` 等字段放在第 15 节 `send` 新增的 `metadata` 里随消息一起走。
+
+以关机为例，完整链路：
 
 ```mermaid
 sequenceDiagram
@@ -1057,18 +1071,18 @@ sequenceDiagram
 ```python
 @dataclass
 class ProtocolState:
-    request_id: str     # 贯穿请求-响应的关联键，如 "req_004281"
-    type: str           # "shutdown" | "plan_approval"
-    sender: str
-    target: str
-    status: str         # pending | approved | rejected
-    payload: str        # 计划文本或关机原因
-    created_at: float = field(default_factory=time.time)
+    request_id: str      # 唯一 ID，如 "req_004281"
+    type: str            # "shutdown" | "plan_approval"
+    sender: str          # 发起方
+    target: str          # 接收方
+    status: str          # pending | approved | rejected
+    payload: str         # 计划文本或关机原因
+    created_at: float    # 时间戳
 
 pending_requests: dict[str, ProtocolState] = {}   # request_id -> 状态
 ```
 
-响应匹配做三关校验：
+协议响应匹配会做三关校验：
 
 ```python
 EXPECTED = {"shutdown": "shutdown_response",
@@ -1085,11 +1099,11 @@ def match_response(response_type: str, request_id: str, approve: bool):
 
 三关分别挡：伪造/过期的 request_id、类型错配的响应、重复投递。这和 TCP 用序列号关联请求响应是同一个思路。
 
-收件箱消费统一到一个入口，顺便自动路由协议响应：
+Lead 的 `check_inbox` 工具和主循环末尾都调用同一个 `consume_lead_inbox()` 函数，先路由协议消息再返回剩余内容，避免消息被读走但协议状态没更新：
 
 ```python
 def consume_lead_inbox(route_protocol=True) -> list[dict]:
-    """Lead 收件箱的**唯一**消费入口。顺便自动路由协议响应，然后返回所有消息。"""
+    """Lead 收件箱的唯一消费入口。顺便自动路由协议响应，然后返回所有消息。"""
     msgs = BUS.read_inbox("lead")
     if route_protocol:
         for msg in msgs:
@@ -1099,7 +1113,7 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
     return msgs
 ```
 
-队友这一侧的变化是：干完活不再退出，而是进入空闲等待。
+队友这一侧的变化是：干完活不再退出，而是进入空闲等待。轮询 inbox，收到 shutdown_request 就响应退出，收到新消息就继续工作。
 
 ```python
 # 干完活后不再退出，而是：while not shutdown_requested，每 1s 读一次自己的收件箱：
@@ -1112,7 +1126,7 @@ def consume_lead_inbox(route_protocol=True) -> list[dict]:
 
 ### 要点与取舍
 
-- **统一消费入口是必需的**，不是洁癖。`read_inbox` 是消费式的（读完删），如果 `check_inbox` 工具和主循环各自调一次，谁先调谁拿到消息，另一边就永久看不到了。**凡是"读取即删除"的资源，消费入口必须唯一。**
+- **统一消费入口是必需的**。`read_inbox` 是消费式的（读完删），如果 `check_inbox` 工具和主循环各自调一次，谁先调谁拿到消息，另一边就永久看不到了。**凡是"读取即删除"的资源，消费入口必须唯一。**
 - **三关的顺序不能反**：先确认请求存在（挡伪造）→ 再比对类型（挡错配）→ 最后查状态（挡重复）。最后一关实际上就是幂等保证，异步消息重复投递时不会把已经 approved 的请求再改一次。
 - **`created_at` 记了但没用上**：最小实现没有超时清理，`pending_requests` 里的请求如果对方线程中途挂了，状态会永久停在 pending。生产实现需要给协议请求配超时 + 重发或强制回收。
 
@@ -1157,7 +1171,9 @@ def scan_unclaimed_tasks() -> list[dict]:
     return unclaimed
 ```
 
-空闲轮询走三个通道，顺序有讲究：
+上一节的队友做完任务就退出。这一节加了 IDLE 阶段，队友在外层循环中反复 WORK 和 IDLE 交替进行，直到超时或收到关机请求。
+
+空闲轮询走三个通道，顺序不能改：
 
 ```python
 def idle_poll(agent_name, messages, name, role) -> str:
@@ -1186,9 +1202,8 @@ def idle_poll(agent_name, messages, name, role) -> str:
 
 ### 要点与取舍
 
-- **收件箱必须先于任务板检查**。反过来的话，任务板一直有活，关机请求就永远排不上——被饿死。控制信令优先于工作信令，这是通用原则。
-- **`claim_task` 的 owner 检查是乐观锁**。两个队友同时扫到同一个任务，先写成功的那个把 `owner` 和 `status` 落盘，第二个再 `claim` 时因为 `status != pending` 被拒。没有文件锁，但能挡住绝大多数竞态。真正的强一致需要文件锁或 CAS（compare-and-swap，"先比对再写入"的原子操作）。
-- **身份重注入**：上下文压缩之后，队友可能"忘了自己是谁"（name 和 role 在早期消息里，被压掉了）。所以每次恢复工作时重新注入身份信息。这个坑在长时间运行的 Agent 上一定会遇到。
+- **收件箱必须先于任务板检查**。反过来的话，任务板一直有活，关机请求就永远排不上。因此必须控制信令优先于工作信令。
+- **`claim_task` 并发认领可能出现竞争**。两个队友同时扫到同一个任务，先写成功的那个把 `owner` 和 `status` 落盘，第二个再 `claim` 时因为 `status != pending` 被拒。没有文件锁，但能挡住绝大多数竞争。真正的强一致需要文件锁或 CAS（compare-and-swap，"先比对再写入"的原子操作）。
 - **超时退出而不是永久驻留**：60 秒没活就发个 summary 退出，避免一堆空转线程。Claude Code 是等到显式关机请求才退。
 
 ---
